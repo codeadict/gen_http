@@ -1,0 +1,10 @@
+{application, gen_http, [
+    {description, "HTTP client for Erlang and Elixir with support for HTTP/1 and HTTP/2"},
+    {vsn, git},
+    {applications, [kernel, stdlib, crypto, asn1, public_key, ssl]},
+    {registered, []},
+    {licenses, ["Apache-2.0"]},
+    {maintainers, ["Dairon Medina Caro"]},
+    {links, [{"GitHub", "https://github.com/codeadict/gen_http"}]},
+    {exclude_files, []}
+]}.
