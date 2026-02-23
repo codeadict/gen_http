@@ -8,10 +8,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.caddy
-    # In GitHub Actions we want to access the files created
-    # by Caddy. However, in Linux these end up being owned by root
-    # because the container by default runs using the root user
-    # and we are not root in the GH action so we cannot access them.
+    # For local development, set DOCKER_USER to your username in .env
+    # to avoid file permission issues. In CI, this defaults to root.
+    # Example: DOCKER_USER=$(whoami)
     user: "${DOCKER_USER:-root}"
     environment:
       - HTTPBIN_HTTP_PORT=${HTTPBIN_HTTP_PORT:-8080}
