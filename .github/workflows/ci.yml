@@ -28,9 +28,6 @@ jobs:
           - otp: '25.3'
             rebar3: '3.23.0'
 
-    env:
-      DOCKER_USER: "${{ github.actor }}"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
