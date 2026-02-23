@@ -1,0 +1,1165 @@
+-module(gen_http_h2).
+-feature(maybe_expr, enable).
+
+%% @doc HTTP/2 connection state machine.
+%%
+%% This module implements a process-less HTTP/2 client with support for:
+%% - Stream multiplexing (multiple concurrent requests)
+%% - Flow control (connection and stream level)
+%% - Settings negotiation
+%% - HPACK header compression
+%% - Server push
+%% - GOAWAY handling
+%%
+%% The connection state is a pure data structure passed between function calls.
+
+%% Compiler optimizations for hot-path functions
+-compile(inline).
+-compile({inline_size, 128}).
+
+-include("include/gen_http.hrl").
+-include("gen_http_h2_frames.hrl").
+
+-export([
+    connect/3,
+    connect/4,
+    request/5,
+    stream/2,
+    stream_request_body/3,
+    recv/3,
+    set_mode/2,
+    controlling_process/2,
+    put_log/2,
+    close/1,
+    is_open/1,
+    get_socket/1,
+    put_private/3,
+    get_private/2,
+    get_private/3,
+    delete_private/2
+]).
+
+-export_type([
+    conn/0,
+    stream_id/0,
+    h2_response/0,
+    address/0,
+    headers/0,
+    request_ref/0,
+    response/0,
+    scheme/0,
+    socket/0
+]).
+
+%% eqWalizer has limited support for maybe expressions
+-eqwalizer({nowarn_function, connect/4}).
+-eqwalizer({nowarn_function, send_request/5}).
+-eqwalizer({nowarn_function, send_data_frame/4}).
+
+-type stream_id() :: pos_integer().
+-type stream_state_name() :: idle | open | half_closed_local | half_closed_remote | closed.
+-type h2_response() ::
+    {headers, reference(), stream_id(), headers()}
+    | {data, reference(), stream_id(), binary()}
+    | {done, reference(), stream_id()}
+    | {push_promise, reference(), stream_id(), stream_id(), headers()}
+    | {error, reference(), stream_id(), term()}.
+
+-record(gen_http_h2_conn, {
+    %% Transport
+    transport :: module(),
+    socket :: socket(),
+    host :: binary(),
+    port :: inet:port_number(),
+    scheme :: http | https,
+
+    %% Connection state
+    state = open :: open | closing | closed,
+    mode = active :: active | passive,
+
+    %% HTTP/2 State
+    buffer = <<>> :: binary(),
+    hpack_encode :: gen_http_parser_hpack:context(),
+    hpack_decode :: gen_http_parser_hpack:context(),
+
+    %% Streams
+    streams = #{} :: #{stream_id() => stream_state()},
+    next_stream_id = 1 :: pos_integer(),
+    max_concurrent = 100 :: pos_integer(),
+
+    %% Flow Control
+    send_window = 65535 :: non_neg_integer(),
+    recv_window = 65535 :: non_neg_integer(),
+    initial_window_size = 65535 :: pos_integer(),
+
+    %% Settings
+    local_settings = #{} :: map(),
+    remote_settings = #{} :: map(),
+    settings_acked = false :: boolean(),
+
+    %% Connection preface sent
+    preface_sent = false :: boolean(),
+
+    %% Logging
+    log = false :: boolean(),
+
+    %% User metadata storage
+    private = #{} :: #{term() => term()}
+}).
+
+-record(stream_state, {
+    id :: stream_id(),
+    state = idle :: stream_state_name(),
+    ref :: reference(),
+    method :: binary(),
+
+    %% Response
+    status :: status() | undefined,
+    response_headers = [] :: headers(),
+
+    %% Flow Control
+    send_window :: non_neg_integer(),
+    recv_window :: non_neg_integer(),
+
+    %% Data
+    data_buffer = <<>> :: binary(),
+    %% For CONTINUATION frames
+    headers_buffer = <<>> :: binary(),
+
+    %% Priority (optional)
+    priority :: non_neg_integer() | undefined,
+    dependency :: stream_id() | undefined,
+    weight :: pos_integer() | undefined
+}).
+
+-type conn() :: #gen_http_h2_conn{}.
+-type stream_state() :: #stream_state{}.
+
+%%====================================================================
+%% HTTP/2 Constants
+%%====================================================================
+
+-define(CONNECTION_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
+-define(DEFAULT_WINDOW_SIZE, 65535).
+-define(MAX_FRAME_SIZE, 16384).
+
+%% Default settings
+-define(DEFAULT_SETTINGS, #{
+    header_table_size => 4096,
+    enable_push => true,
+    max_concurrent_streams => 100,
+    initial_window_size => ?DEFAULT_WINDOW_SIZE,
+    max_frame_size => ?MAX_FRAME_SIZE,
+    max_header_list_size => undefined
+}).
+
+%%====================================================================
+%% API Functions
+%%====================================================================
+
+%% @doc Establish an HTTP/2 connection.
+-spec connect(scheme(), address(), inet:port_number()) ->
+    {ok, conn()} | {error, term()}.
+connect(Scheme, Address, Port) ->
+    connect(Scheme, Address, Port, #{}).
+
+%% @doc Establish an HTTP/2 connection with options.
+-spec connect(scheme(), address(), inet:port_number(), map()) ->
+    {ok, conn()} | {error, term()}.
+connect(Scheme, Address, Port, Opts) ->
+    Transport = gen_http_transport:module_for_scheme(Scheme),
+    Timeout = maps:get(timeout, Opts, 5000),
+    Mode = maps:get(mode, Opts, active),
+    MaxConcurrent = maps:get(max_concurrent, Opts, 100),
+
+    TransportOpts = maps:get(transport_opts, Opts, []),
+
+    %% For HTTPS, ensure we advertise h2 protocol
+    ConnectOpts =
+        case Scheme of
+            https ->
+                AlpnOpts =
+                    case proplists:get_value(alpn_advertise, TransportOpts) of
+                        undefined -> [{alpn_advertise, [<<"h2">>, <<"http/1.1">>]}];
+                        %% User explicitly set ALPN, respect it
+                        _ -> []
+                    end,
+                [{timeout, Timeout} | AlpnOpts ++ TransportOpts];
+            http ->
+                %% HTTP/2 over cleartext requires h2c upgrade (not implemented yet)
+                [{timeout, Timeout} | TransportOpts]
+        end,
+
+    maybe
+        {ok, Socket} ?= Transport:connect(Address, Port, ConnectOpts),
+        ok ?= setup_socket_mode(Transport, Socket, Mode),
+        %% Create connection with HPACK contexts
+        HpackEncode = gen_http_parser_hpack:new(),
+        HpackDecode = gen_http_parser_hpack:new(),
+        Conn = #gen_http_h2_conn{
+            transport = Transport,
+            socket = Socket,
+            host = ensure_binary(Address),
+            port = Port,
+            scheme = Scheme,
+            mode = Mode,
+            max_concurrent = MaxConcurrent,
+            hpack_encode = HpackEncode,
+            hpack_decode = HpackDecode,
+            initial_window_size = ?DEFAULT_WINDOW_SIZE,
+            local_settings = ?DEFAULT_SETTINGS
+        },
+        %% Send connection preface and initial SETTINGS
+        Conn2 = send_preface(Conn),
+        {ok, Conn2}
+    else
+        {error, Reason} -> {error, transport_error({connect_failed, Reason})}
+    end.
+
+%% @doc Send an HTTP/2 request.
+-spec request(conn(), binary(), binary(), headers(), iodata() | stream) ->
+    {ok, conn(), reference(), stream_id()} | {error, conn(), term()}.
+request(Conn, Method, Path, Headers, Body) ->
+    send_request(Conn, Method, Path, Headers, Body).
+
+%% @doc Process socket messages (active mode).
+-spec stream(conn(), term()) ->
+    {ok, conn(), [h2_response()]}
+    | {error, conn(), term(), [h2_response()]}
+    | unknown.
+stream(Conn, Message) ->
+    Socket = Conn#gen_http_h2_conn.socket,
+    case Message of
+        {tcp, Socket, Data} -> handle_data(Conn, Data);
+        {ssl, Socket, Data} -> handle_data(Conn, Data);
+        {tcp_closed, Socket} -> handle_closed(Conn);
+        {ssl_closed, Socket} -> handle_closed(Conn);
+        {tcp_error, Socket, Reason} -> handle_error(Conn, Reason);
+        {ssl_error, Socket, Reason} -> handle_error(Conn, Reason);
+        _ -> unknown
+    end.
+
+%% @doc Stream request body (chunked upload).
+-spec stream_request_body(conn(), stream_id(), iodata() | eof) ->
+    {ok, conn()} | {error, conn(), term()}.
+stream_request_body(Conn, StreamId, Chunk) ->
+    send_data_frame(Conn, StreamId, Chunk, false).
+
+%% @doc Receive data from the connection in passive mode.
+%%
+%% This function blocks until data is received or timeout occurs.
+%% The connection must be in passive mode, otherwise this raises badarg.
+%%
+%% Options:
+%%   - ByteCount - Number of bytes to receive (0 for all available)
+%%   - Timeout - Timeout in milliseconds
+%%
+%% Returns `{ok, Conn, Responses}` on success or `{error, Conn, Reason}` on failure.
+-spec recv(conn(), non_neg_integer(), timeout()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+recv(#gen_http_h2_conn{mode = passive} = Conn, ByteCount, Timeout) ->
+    #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
+    case Transport:recv(Socket, ByteCount, Timeout) of
+        {ok, Data} ->
+            handle_data(Conn, Data);
+        {error, closed} ->
+            handle_closed(Conn);
+        {error, timeout} ->
+            {error, Conn, transport_error(timeout)};
+        {error, Reason} ->
+            NewConn = Conn#gen_http_h2_conn{state = closed},
+            {error, NewConn, transport_error(Reason)}
+    end;
+recv(#gen_http_h2_conn{mode = active}, _, _) ->
+    error(badarg, [recv_requires_passive_mode]).
+
+%% @doc Switch the connection socket mode between active and passive.
+%%
+%% Active mode (default):
+%%   - Socket delivers messages to the owning process automatically
+%%   - Uses `{active, once}` for flow control
+%%   - Process them with `stream/2`
+%%
+%% Passive mode:
+%%   - Explicit data retrieval using `recv/3`
+%%   - Blocks until data is available
+%%
+%% Returns `{ok, Conn}` with updated mode or `{error, Conn, Reason}` on failure.
+-spec set_mode(conn(), active | passive) -> {ok, conn()} | {error, conn(), term()}.
+set_mode(Conn, Mode) when Mode =:= active; Mode =:= passive ->
+    #gen_http_h2_conn{transport = Transport, socket = Socket, mode = CurrentMode} = Conn,
+    case Mode of
+        CurrentMode ->
+            %% Already in target mode, no-op
+            {ok, Conn};
+        _ ->
+            %% Convert mode to socket option
+            SocketMode =
+                case Mode of
+                    active -> {active, once};
+                    passive -> {active, false}
+                end,
+            case Transport:setopts(Socket, [SocketMode]) of
+                ok -> {ok, Conn#gen_http_h2_conn{mode = Mode}};
+                {error, Reason} -> {error, Conn, transport_error({setopts_failed, Reason})}
+            end
+    end.
+
+%% @doc Transfer socket ownership to another process.
+%%
+%% This is useful for connection pooling patterns where you want to hand off
+%% an established connection to a worker process.
+%%
+%% After calling this, the new process will receive socket messages.
+%%
+%% Returns `{ok, Conn}` on success or `{error, Conn, Reason}` on failure.
+-spec controlling_process(conn(), pid()) -> {ok, conn()} | {error, conn(), term()}.
+controlling_process(Conn, Pid) when is_pid(Pid) ->
+    #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
+    case Transport:controlling_process(Socket, Pid) of
+        ok -> {ok, Conn};
+        {error, Reason} -> {error, Conn, transport_error({controlling_process_failed, Reason})}
+    end.
+
+%% @doc Enable or disable debug logging for this connection.
+%%
+%% When enabled, the connection will log debug information about frames,
+%% requests, and responses. This is useful for debugging but adds overhead.
+%%
+%% Returns `{ok, Conn}` with updated logging state.
+-spec put_log(conn(), boolean()) -> {ok, conn()}.
+put_log(Conn, Log) when is_boolean(Log) ->
+    {ok, Conn#gen_http_h2_conn{log = Log}}.
+
+%% @doc Close the connection.
+-spec close(conn()) -> {ok, conn()}.
+close(Conn) ->
+    case Conn#gen_http_h2_conn.state of
+        open ->
+            %% Send GOAWAY frame
+            GoAway = #goaway{
+                stream_id = 0,
+                last_stream_id = 0,
+                error_code = no_error,
+                debug_data = <<>>
+            },
+            Conn2 = send_frame(Conn, GoAway),
+
+            %% Close socket
+            Transport = Conn2#gen_http_h2_conn.transport,
+            Socket = Conn2#gen_http_h2_conn.socket,
+            Transport:close(Socket),
+
+            {ok, Conn2#gen_http_h2_conn{state = closed}};
+        _ ->
+            {ok, Conn}
+    end.
+
+%% @doc Check if connection is open.
+-spec is_open(conn()) -> boolean().
+is_open(#gen_http_h2_conn{state = State}) ->
+    State =:= open.
+
+%% @doc Get the underlying socket.
+-spec get_socket(conn()) -> socket().
+get_socket(#gen_http_h2_conn{socket = Socket}) ->
+    Socket.
+
+%% @doc Store a private key-value pair in the connection.
+%%
+%% This allows users to attach metadata to connections (e.g., pool ID, metrics, tags).
+-spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
+put_private(#gen_http_h2_conn{private = Private} = Conn, Key, Value) ->
+    Conn#gen_http_h2_conn{private = maps:put(Key, Value, Private)}.
+
+%% @doc Get a private value from the connection.
+%%
+%% Returns `undefined` if the key doesn't exist.
+-spec get_private(conn(), Key :: term()) -> term() | undefined.
+get_private(Conn, Key) ->
+    get_private(Conn, Key, undefined).
+
+%% @doc Get a private value from the connection with a default.
+-spec get_private(conn(), Key :: term(), Default :: term()) -> term().
+get_private(#gen_http_h2_conn{private = Private}, Key, Default) ->
+    maps:get(Key, Private, Default).
+
+%% @doc Delete a private key from the connection.
+-spec delete_private(conn(), Key :: term()) -> conn().
+delete_private(#gen_http_h2_conn{private = Private} = Conn, Key) ->
+    Conn#gen_http_h2_conn{private = maps:remove(Key, Private)}.
+
+%%====================================================================
+%% Internal Functions - Connection Setup
+%%====================================================================
+
+-spec setup_socket_mode(module(), socket(), active | passive) -> ok | {error, gen_http:error_reason()}.
+setup_socket_mode(Transport, Socket, active) ->
+    case Transport:setopts(Socket, [{active, once}]) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            Transport:close(Socket),
+            {error, transport_error({setopts_failed, Reason})}
+    end;
+setup_socket_mode(_Transport, _Socket, passive) ->
+    ok.
+
+-spec ensure_binary(address()) -> binary().
+ensure_binary(Addr) when is_binary(Addr) -> Addr;
+ensure_binary(Addr) when is_list(Addr) -> list_to_binary(Addr);
+ensure_binary(Addr) when is_atom(Addr) -> atom_to_binary(Addr, utf8).
+
+%% @doc Send connection preface and initial SETTINGS frame.
+-spec send_preface(conn()) -> conn().
+send_preface(Conn) ->
+    #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
+
+    %% Send magic string
+    ok = Transport:send(Socket, ?CONNECTION_PREFACE),
+
+    %% Send initial SETTINGS frame (filter out undefined values)
+    AllParams = maps:to_list(Conn#gen_http_h2_conn.local_settings),
+    FilteredParams = lists:filter(fun({_Key, Value}) -> Value =/= undefined end, AllParams),
+    Settings = #settings{
+        stream_id = 0,
+        params = FilteredParams
+    },
+    Encoded = gen_http_parser_h2:encode(Settings),
+    ok = Transport:send(Socket, Encoded),
+
+    Conn#gen_http_h2_conn{preface_sent = true}.
+
+%%====================================================================
+%% Internal Functions - Request Sending
+%%====================================================================
+
+-spec send_request(conn(), binary(), binary(), headers(), iodata() | stream) ->
+    {ok, conn(), reference(), stream_id()} | {error, conn(), term()}.
+send_request(Conn, Method, Path, Headers, Body) ->
+    %% Check if we can create a new stream
+    case can_create_stream(Conn) of
+        false ->
+            {error, Conn, protocol_error(max_concurrent_streams_exceeded)};
+        true ->
+            %% Allocate stream ID
+            StreamId = Conn#gen_http_h2_conn.next_stream_id,
+            Ref = make_ref(),
+
+            %% Create stream state
+            Stream = #stream_state{
+                id = StreamId,
+                state = idle,
+                ref = Ref,
+                method = Method,
+                send_window = Conn#gen_http_h2_conn.initial_window_size,
+                recv_window = Conn#gen_http_h2_conn.initial_window_size
+            },
+
+            %% Add pseudo-headers
+            Scheme = atom_to_binary(Conn#gen_http_h2_conn.scheme, utf8),
+            Authority = format_authority(
+                Conn#gen_http_h2_conn.host,
+                Conn#gen_http_h2_conn.port
+            ),
+            PseudoHeaders = [
+                {<<":method">>, Method},
+                {<<":path">>, Path},
+                {<<":scheme">>, Scheme},
+                {<<":authority">>, Authority}
+            ],
+
+            %% Combine with user headers
+            AllHeaders = PseudoHeaders ++ Headers,
+
+            %% Encode headers with HPACK
+            {ok, HeaderBlock, NewHpackEncode} = gen_http_parser_hpack:encode(
+                AllHeaders,
+                Conn#gen_http_h2_conn.hpack_encode
+            ),
+
+            %% Send HEADERS frame
+            HeadersFrame = #h2_headers{
+                stream_id = StreamId,
+                flags =
+                    case Body of
+                        <<>> -> gen_http_parser_h2:set_flags(0, headers, [end_headers, end_stream]);
+                        _ -> gen_http_parser_h2:set_flags(0, headers, [end_headers])
+                    end,
+                hbf = HeaderBlock
+            },
+
+            Conn2 = send_frame(Conn, HeadersFrame),
+
+            %% Update stream state
+            NewStream = Stream#stream_state{
+                state =
+                    case Body of
+                        <<>> -> half_closed_local;
+                        _ -> open
+                    end
+            },
+
+            Conn3 = Conn2#gen_http_h2_conn{
+                streams = maps:put(StreamId, NewStream, Conn2#gen_http_h2_conn.streams),
+                %% Client uses odd numbers
+                next_stream_id = StreamId + 2,
+                hpack_encode = NewHpackEncode
+            },
+
+            %% Send body if present
+            case Body of
+                <<>> ->
+                    {ok, Conn3, Ref, StreamId};
+                stream ->
+                    %% Streaming body, caller will send chunks
+                    {ok, Conn3, Ref, StreamId};
+                _ ->
+                    %% Send body immediately
+                    case send_all_data(Conn3, StreamId, Body) of
+                        {ok, Conn4} -> {ok, Conn4, Ref, StreamId};
+                        {error, Conn4, Reason} -> {error, Conn4, Reason}
+                    end
+            end
+    end.
+
+-spec can_create_stream(conn()) -> boolean().
+can_create_stream(Conn) ->
+    ActiveStreams = maps:size(Conn#gen_http_h2_conn.streams),
+    ActiveStreams < Conn#gen_http_h2_conn.max_concurrent.
+
+-spec format_authority(binary(), inet:port_number()) -> binary().
+format_authority(Host, 80) -> Host;
+format_authority(Host, 443) -> Host;
+format_authority(Host, Port) -> <<Host/binary, ":", (integer_to_binary(Port))/binary>>.
+
+%%====================================================================
+%% Internal Functions - Frame Sending
+%%====================================================================
+
+-spec send_frame(conn(), tuple()) -> conn().
+send_frame(Conn, Frame) ->
+    #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
+    Encoded = gen_http_parser_h2:encode(Frame),
+    ok = Transport:send(Socket, Encoded),
+    Conn.
+
+-spec send_data_frame(conn(), stream_id(), iodata() | eof, boolean()) ->
+    {ok, conn()} | {error, conn(), term()}.
+send_data_frame(Conn, StreamId, eof, _IsLast) ->
+    %% Send empty DATA frame with END_STREAM flag
+    DataFrame = #data{
+        stream_id = StreamId,
+        flags = gen_http_parser_h2:set_flags(0, data, [end_stream]),
+        data = <<>>
+    },
+    Conn2 = send_frame(Conn, DataFrame),
+
+    %% Update stream state to half_closed_local
+    case maps:find(StreamId, Conn2#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            NewStream = Stream#stream_state{state = half_closed_local},
+            {ok, update_stream(Conn2, StreamId, NewStream)};
+        error ->
+            {error, Conn2, application_error({invalid_stream_id, StreamId})}
+    end;
+send_data_frame(Conn, StreamId, Data, IsLast) when is_binary(Data) orelse is_list(Data) ->
+    BinData = iolist_to_binary(Data),
+
+    %% Check flow control windows
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            ConnWindow = Conn#gen_http_h2_conn.send_window,
+            StreamWindow = Stream#stream_state.send_window,
+            MaxSend = min(ConnWindow, min(StreamWindow, byte_size(BinData))),
+
+            case MaxSend of
+                0 ->
+                    %% Flow control blocked
+                    {error, Conn, protocol_error({flow_control_blocked, StreamId})};
+                _ ->
+                    <<ToSend:MaxSend/binary, _Rest/binary>> = BinData,
+
+                    %% Send DATA frame
+                    Flags =
+                        case IsLast andalso MaxSend =:= byte_size(BinData) of
+                            true -> gen_http_parser_h2:set_flags(0, data, [end_stream]);
+                            false -> 0
+                        end,
+
+                    DataFrame = #data{
+                        stream_id = StreamId,
+                        flags = Flags,
+                        data = ToSend
+                    },
+
+                    Conn2 = send_frame(Conn, DataFrame),
+
+                    %% Update windows
+                    NewStream = Stream#stream_state{
+                        send_window = StreamWindow - MaxSend
+                    },
+                    Conn3 = Conn2#gen_http_h2_conn{
+                        send_window = ConnWindow - MaxSend
+                    },
+                    Conn4 = update_stream(Conn3, StreamId, NewStream),
+
+                    %% TODO: Handle remaining data if MaxSend < byte_size(BinData)
+                    {ok, Conn4}
+            end;
+        error ->
+            {error, Conn, application_error({invalid_stream_id, StreamId})}
+    end.
+
+-spec send_all_data(conn(), stream_id(), iodata()) ->
+    {ok, conn()} | {error, conn(), term()}.
+send_all_data(Conn, StreamId, Data) ->
+    BinData = iolist_to_binary(Data),
+    %% TODO: Split into multiple frames if needed
+    %% For now, send in one frame with END_STREAM
+    send_data_frame(Conn, StreamId, BinData, true).
+
+%%====================================================================
+%% Internal Functions - Frame Receiving
+%%====================================================================
+
+-spec handle_data(conn(), binary()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term(), [h2_response()]}.
+handle_data(Conn, Data) ->
+    #gen_http_h2_conn{buffer = Buffer, mode = Mode, transport = Transport, socket = Socket} = Conn,
+    NewBuffer = <<Buffer/binary, Data/binary>>,
+
+    case parse_frames(Conn#gen_http_h2_conn{buffer = NewBuffer}, []) of
+        {ok, NewConn, Responses} ->
+            reactivate_socket_if_needed(Transport, Socket, Mode, NewConn),
+            {ok, NewConn, lists:reverse(Responses)};
+        {error, NewConn, Reason, Responses} ->
+            {error, NewConn, Reason, lists:reverse(Responses)}
+    end.
+
+-spec parse_frames(conn(), [h2_response()]) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term(), [h2_response()]}.
+parse_frames(Conn, Acc) ->
+    case gen_http_parser_h2:decode_next(Conn#gen_http_h2_conn.buffer) of
+        {ok, Frame, Rest} ->
+            case handle_frame(Conn#gen_http_h2_conn{buffer = Rest}, Frame) of
+                {ok, NewConn, Responses} ->
+                    parse_frames(NewConn, Responses ++ Acc);
+                {error, NewConn, Reason} ->
+                    {error, NewConn, Reason, Acc}
+            end;
+        more ->
+            {ok, Conn, Acc};
+        {error, Reason} ->
+            {error, Conn, protocol_error({frame_parse_error, Reason}), Acc}
+    end.
+
+-spec handle_frame(conn(), tuple()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_frame(Conn, Frame) ->
+    handle_frame_dispatch(Conn, Frame).
+
+handle_frame_dispatch(
+    Conn,
+    #settings{stream_id = 0, flags = Flags, params = Params}
+) ->
+    handle_settings_frame(Conn, Flags, Params);
+handle_frame_dispatch(Conn, #h2_headers{stream_id = StreamId} = Frame) ->
+    handle_headers_frame(Conn, StreamId, Frame);
+handle_frame_dispatch(Conn, #data{stream_id = StreamId} = Frame) ->
+    handle_data_frame(Conn, StreamId, Frame);
+handle_frame_dispatch(
+    Conn,
+    #window_update{stream_id = StreamId, window_size_increment = Inc}
+) ->
+    handle_window_update_frame(Conn, StreamId, Inc);
+handle_frame_dispatch(
+    Conn,
+    #goaway{last_stream_id = LastId, error_code = ErrorCode, debug_data = Debug}
+) ->
+    handle_goaway_frame(Conn, LastId, ErrorCode, Debug);
+handle_frame_dispatch(Conn, #rst_stream{stream_id = StreamId, error_code = ErrorCode}) ->
+    handle_rst_stream_frame(Conn, StreamId, ErrorCode);
+handle_frame_dispatch(Conn, #ping{flags = Flags, opaque_data = Data}) ->
+    handle_ping_frame(Conn, Flags, Data);
+handle_frame_dispatch(Conn, #push_promise{stream_id = StreamId} = Frame) ->
+    handle_push_promise_frame(Conn, StreamId, Frame);
+handle_frame_dispatch(Conn, #priority{stream_id = StreamId} = Frame) ->
+    handle_priority_frame(Conn, StreamId, Frame);
+handle_frame_dispatch(Conn, #continuation{stream_id = StreamId} = Frame) ->
+    handle_continuation_frame(Conn, StreamId, Frame);
+handle_frame_dispatch(Conn, _UnknownFrame) ->
+    %% Ignore unknown frames as per HTTP/2 spec
+    {ok, Conn, []}.
+
+%%====================================================================
+%% Internal Functions - Frame Handlers
+%%====================================================================
+
+%% @doc Handle SETTINGS frame.
+-spec handle_settings_frame(conn(), byte(), list()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_settings_frame(Conn, Flags, Params) ->
+    AckFlag = gen_http_parser_h2:is_flag_set(Flags, settings, ack),
+    case AckFlag of
+        true ->
+            %% ACK for our SETTINGS, just acknowledge
+            {ok, Conn#gen_http_h2_conn{settings_acked = true}, []};
+        false ->
+            %% Server sent SETTINGS, update and send ACK
+            NewRemoteSettings = lists:foldl(
+                fun({Key, Value}, Acc) ->
+                    maps:put(Key, Value, Acc)
+                end,
+                Conn#gen_http_h2_conn.remote_settings,
+                Params
+            ),
+
+            %% If initial_window_size changed, update all streams
+            Conn2 =
+                case lists:keyfind(initial_window_size, 1, Params) of
+                    {initial_window_size, NewWindowSize} ->
+                        OldWindowSize = Conn#gen_http_h2_conn.initial_window_size,
+                        Delta = NewWindowSize - OldWindowSize,
+                        update_all_stream_windows(Conn, Delta);
+                    false ->
+                        Conn
+                end,
+
+            %% If header_table_size changed, update HPACK contexts
+            Conn3 =
+                case lists:keyfind(header_table_size, 1, Params) of
+                    {header_table_size, NewTableSize} ->
+                        HpackEncode = Conn2#gen_http_h2_conn.hpack_encode,
+                        HpackDecode = Conn2#gen_http_h2_conn.hpack_decode,
+                        HpackEncode2 = gen_http_parser_hpack:resize_table(HpackEncode, NewTableSize),
+                        HpackDecode2 = gen_http_parser_hpack:resize_table(HpackDecode, NewTableSize),
+                        Conn2#gen_http_h2_conn{
+                            hpack_encode = HpackEncode2,
+                            hpack_decode = HpackDecode2
+                        };
+                    false ->
+                        Conn2
+                end,
+
+            Conn4 = Conn3#gen_http_h2_conn{remote_settings = NewRemoteSettings},
+
+            %% Send SETTINGS ACK
+            AckFrame = #settings{
+                stream_id = 0,
+                flags = gen_http_parser_h2:set_flags(0, settings, [ack]),
+                params = []
+            },
+            Conn5 = send_frame(Conn4, AckFrame),
+
+            {ok, Conn5, []}
+    end.
+
+%% @doc Handle HEADERS frame (response headers).
+-spec handle_headers_frame(conn(), stream_id(), #h2_headers{}) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_headers_frame(Conn, StreamId, #h2_headers{flags = Flags, hbf = HeaderBlock}) ->
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            EndHeaders = gen_http_parser_h2:is_flag_set(Flags, headers, end_headers),
+            EndStream = gen_http_parser_h2:is_flag_set(Flags, headers, end_stream),
+
+            case EndHeaders of
+                true ->
+                    %% Complete header block, decode with HPACK
+                    FullHeaderBlock = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>,
+                    case gen_http_parser_hpack:decode(FullHeaderBlock, Conn#gen_http_h2_conn.hpack_decode) of
+                        {ok, Headers, NewHpackDecode} ->
+                            %% Extract status from :status pseudo-header
+                            Status = extract_status(Headers),
+                            RealHeaders = remove_pseudo_headers(Headers),
+
+                            %% Update stream state
+                            NewStreamState =
+                                case EndStream of
+                                    true -> half_closed_remote;
+                                    false -> Stream#stream_state.state
+                                end,
+
+                            NewStream = Stream#stream_state{
+                                status = Status,
+                                response_headers = RealHeaders,
+                                headers_buffer = <<>>,
+                                state = NewStreamState
+                            },
+
+                            Conn2 = update_stream(Conn, StreamId, NewStream),
+                            Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
+
+                            %% Generate response events
+                            StatusEvent = {headers, Stream#stream_state.ref, StreamId, RealHeaders},
+                            DoneEvent =
+                                case EndStream of
+                                    true -> [{done, Stream#stream_state.ref, StreamId}];
+                                    false -> []
+                                end,
+
+                            Events = [StatusEvent | DoneEvent],
+                            {ok, Conn3, Events};
+                        {error, Reason} ->
+                            {error, Conn, protocol_error({hpack_decode_error, Reason})}
+                    end;
+                false ->
+                    %% Incomplete headers, wait for CONTINUATION
+                    NewStream = Stream#stream_state{
+                        headers_buffer = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>
+                    },
+                    {ok, update_stream(Conn, StreamId, NewStream), []}
+            end;
+        error ->
+            %% Unknown stream, ignore
+            {ok, Conn, []}
+    end.
+
+%% @doc Handle DATA frame (response body).
+-spec handle_data_frame(conn(), stream_id(), #data{}) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_data_frame(Conn, StreamId, #data{flags = Flags, data = Data}) ->
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            EndStream = gen_http_parser_h2:is_flag_set(Flags, data, end_stream),
+            DataSize = byte_size(Data),
+
+            %% Update flow control windows
+            NewRecvWindow = Stream#stream_state.recv_window - DataSize,
+            ConnRecvWindow = Conn#gen_http_h2_conn.recv_window - DataSize,
+
+            %% Check if we need to send WINDOW_UPDATE
+            Conn2 =
+                case NewRecvWindow < (?DEFAULT_WINDOW_SIZE div 2) of
+                    true ->
+                        %% Replenish stream window
+                        Increment = ?DEFAULT_WINDOW_SIZE - NewRecvWindow,
+                        WindowUpdate = #window_update{
+                            stream_id = StreamId,
+                            window_size_increment = Increment
+                        },
+                        send_frame(Conn, WindowUpdate);
+                    false ->
+                        Conn
+                end,
+
+            Conn3 =
+                case ConnRecvWindow < (?DEFAULT_WINDOW_SIZE div 2) of
+                    true ->
+                        %% Replenish connection window
+                        Increment2 = ?DEFAULT_WINDOW_SIZE - ConnRecvWindow,
+                        WindowUpdate2 = #window_update{
+                            stream_id = 0,
+                            window_size_increment = Increment2
+                        },
+                        send_frame(Conn2, WindowUpdate2);
+                    false ->
+                        Conn2
+                end,
+
+            %% Update stream state
+            NewStreamState =
+                case EndStream of
+                    true -> half_closed_remote;
+                    false -> Stream#stream_state.state
+                end,
+
+            NewStream = Stream#stream_state{
+                recv_window = NewRecvWindow,
+                state = NewStreamState
+            },
+
+            Conn4 = update_stream(Conn3, StreamId, NewStream),
+            Conn5 = Conn4#gen_http_h2_conn{recv_window = ConnRecvWindow},
+
+            %% Generate response events
+            DataEvent = {data, Stream#stream_state.ref, StreamId, Data},
+            DoneEvent =
+                case EndStream of
+                    true -> [{done, Stream#stream_state.ref, StreamId}];
+                    false -> []
+                end,
+
+            {ok, Conn5, [DataEvent | DoneEvent]};
+        error ->
+            %% Unknown stream, send RST_STREAM
+            RstFrame = #rst_stream{
+                stream_id = StreamId,
+                error_code = stream_closed
+            },
+            {ok, send_frame(Conn, RstFrame), []}
+    end.
+
+%% @doc Handle WINDOW_UPDATE frame.
+-spec handle_window_update_frame(conn(), stream_id(), non_neg_integer()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_window_update_frame(Conn, 0, Increment) ->
+    %% Connection-level window update
+    NewWindow = Conn#gen_http_h2_conn.send_window + Increment,
+    {ok, Conn#gen_http_h2_conn{send_window = NewWindow}, []};
+handle_window_update_frame(Conn, StreamId, Increment) ->
+    %% Stream-level window update
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            NewWindow = Stream#stream_state.send_window + Increment,
+            NewStream = Stream#stream_state{send_window = NewWindow},
+            {ok, update_stream(Conn, StreamId, NewStream), []};
+        error ->
+            %% Unknown stream, ignore
+            {ok, Conn, []}
+    end.
+
+%% @doc Handle GOAWAY frame.
+-spec handle_goaway_frame(conn(), stream_id(), atom(), binary()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_goaway_frame(Conn, LastStreamId, ErrorCode, _DebugData) ->
+    %% Mark connection as closing
+    NewConn = Conn#gen_http_h2_conn{state = closing},
+
+    %% Generate error events for streams > LastStreamId
+    Responses = maps:fold(
+        fun(StreamId, Stream, Acc) ->
+            case StreamId > LastStreamId of
+                true ->
+                    [{error, Stream#stream_state.ref, StreamId, {goaway, ErrorCode}} | Acc];
+                false ->
+                    Acc
+            end
+        end,
+        [],
+        Conn#gen_http_h2_conn.streams
+    ),
+
+    {ok, NewConn, Responses}.
+
+%% @doc Handle RST_STREAM frame.
+-spec handle_rst_stream_frame(conn(), stream_id(), atom()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_rst_stream_frame(Conn, StreamId, ErrorCode) ->
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            %% Mark stream as closed
+            NewStream = Stream#stream_state{state = closed},
+            Conn2 = update_stream(Conn, StreamId, NewStream),
+
+            %% Generate error event
+            Response = {error, Stream#stream_state.ref, StreamId, {rst_stream, ErrorCode}},
+            {ok, Conn2, [Response]};
+        error ->
+            {ok, Conn, []}
+    end.
+
+%% @doc Handle PING frame.
+-spec handle_ping_frame(conn(), byte(), binary()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_ping_frame(Conn, Flags, OpaqueData) ->
+    AckFlag = gen_http_parser_h2:is_flag_set(Flags, ping, ack),
+    case AckFlag of
+        true ->
+            %% ACK for our PING, ignore
+            {ok, Conn, []};
+        false ->
+            %% Server sent PING, send ACK
+            PingAck = #ping{
+                stream_id = 0,
+                flags = gen_http_parser_h2:set_flags(0, ping, [ack]),
+                opaque_data = OpaqueData
+            },
+            {ok, send_frame(Conn, PingAck), []}
+    end.
+
+%% @doc Handle PUSH_PROMISE frame.
+-spec handle_push_promise_frame(conn(), stream_id(), #push_promise{}) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_push_promise_frame(Conn, _StreamId, _Frame) ->
+    %% TODO: Implement server push support
+    {ok, Conn, []}.
+
+%% @doc Handle PRIORITY frame.
+-spec handle_priority_frame(conn(), stream_id(), #priority{}) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_priority_frame(Conn, _StreamId, _Frame) ->
+    %% TODO: Implement stream priority
+    {ok, Conn, []}.
+
+%% @doc Handle CONTINUATION frame.
+-spec handle_continuation_frame(conn(), stream_id(), #continuation{}) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+handle_continuation_frame(Conn, StreamId, #continuation{flags = Flags, hbf = HeaderBlock}) ->
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            EndHeaders = gen_http_parser_h2:is_flag_set(Flags, continuation, end_headers),
+            FullHeaderBlock = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>,
+
+            case EndHeaders of
+                true ->
+                    %% Complete header block, decode with HPACK
+                    case gen_http_parser_hpack:decode(FullHeaderBlock, Conn#gen_http_h2_conn.hpack_decode) of
+                        {ok, Headers, NewHpackDecode} ->
+                            Status = extract_status(Headers),
+                            RealHeaders = remove_pseudo_headers(Headers),
+
+                            NewStream = Stream#stream_state{
+                                status = Status,
+                                response_headers = RealHeaders,
+                                headers_buffer = <<>>
+                            },
+
+                            Conn2 = update_stream(Conn, StreamId, NewStream),
+                            Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
+
+                            Response = {headers, Stream#stream_state.ref, StreamId, RealHeaders},
+                            {ok, Conn3, [Response]};
+                        {error, Reason} ->
+                            {error, Conn, protocol_error({hpack_decode_error, Reason})}
+                    end;
+                false ->
+                    %% Still incomplete, wait for more CONTINUATION
+                    NewStream = Stream#stream_state{headers_buffer = FullHeaderBlock},
+                    {ok, update_stream(Conn, StreamId, NewStream), []}
+            end;
+        error ->
+            {ok, Conn, []}
+    end.
+
+%%====================================================================
+%% Internal Functions - Error Wrapping
+%%====================================================================
+
+%% @doc Wrap transport errors in structured format.
+-spec transport_error(term()) -> gen_http:error_reason().
+transport_error(closed) -> {transport_error, closed};
+transport_error(timeout) -> {transport_error, timeout};
+transport_error(econnrefused) -> {transport_error, econnreset};
+transport_error(econnreset) -> {transport_error, econnreset};
+transport_error(ehostunreach) -> {transport_error, ehostunreach};
+transport_error(enetunreach) -> {transport_error, enetunreach};
+transport_error(nxdomain) -> {transport_error, nxdomain};
+transport_error({ssl_error, _} = E) -> {transport_error, E};
+transport_error({send_failed, _} = E) -> {transport_error, E};
+transport_error({setopts_failed, _} = E) -> {transport_error, E};
+transport_error({connect_failed, _} = E) -> {transport_error, E};
+transport_error({controlling_process_failed, _} = E) -> {transport_error, E};
+transport_error(Other) -> {transport_error, Other}.
+
+%% @doc Wrap protocol errors in structured format.
+%% Only handles errors that are actually raised in this module
+-spec protocol_error(
+    max_concurrent_streams_exceeded
+    | {flow_control_blocked, term()}
+    | {frame_parse_error, term()}
+    | {hpack_decode_error, term()}
+) -> gen_http:error_reason().
+protocol_error({frame_parse_error, _} = E) -> {protocol_error, E};
+protocol_error({hpack_decode_error, _} = E) -> {protocol_error, E};
+protocol_error({flow_control_blocked, _} = E) -> {protocol_error, E};
+protocol_error(max_concurrent_streams_exceeded) -> {protocol_error, max_concurrent_streams_exceeded}.
+
+%% @doc Wrap application errors in structured format.
+-spec application_error(
+    connection_closed
+    | {invalid_stream_id, pos_integer()}
+    | unexpected_close
+) -> gen_http:error_reason().
+application_error(connection_closed) -> {application_error, connection_closed};
+application_error({invalid_stream_id, _} = E) -> {application_error, E};
+application_error(unexpected_close) -> {application_error, unexpected_close}.
+
+%%====================================================================
+%% Internal Functions - Header Processing
+%%====================================================================
+
+-spec extract_status(headers()) -> status().
+extract_status(Headers) ->
+    case lists:keyfind(<<":status">>, 1, Headers) of
+        {<<":status">>, StatusBin} ->
+            binary_to_integer(StatusBin);
+        false ->
+            %% Default if not found
+            200
+    end.
+
+-spec remove_pseudo_headers(headers()) -> headers().
+remove_pseudo_headers(Headers) ->
+    lists:filter(
+        fun({Name, _}) ->
+            case Name of
+                <<$:, _/binary>> -> false;
+                _ -> true
+            end
+        end,
+        Headers
+    ).
+
+-spec update_all_stream_windows(conn(), integer()) -> conn().
+update_all_stream_windows(Conn, Delta) ->
+    NewStreams = maps:map(
+        fun(_Id, Stream) ->
+            OldWindow = Stream#stream_state.send_window,
+            Stream#stream_state{send_window = OldWindow + Delta}
+        end,
+        Conn#gen_http_h2_conn.streams
+    ),
+    Conn#gen_http_h2_conn{streams = NewStreams}.
+
+%%====================================================================
+%% Internal Functions - Connection Close
+%%====================================================================
+
+-spec handle_closed(conn()) ->
+    {error, conn(), term(), [h2_response()]}.
+handle_closed(Conn) ->
+    NewConn = Conn#gen_http_h2_conn{state = closed},
+    Responses = generate_close_responses(Conn#gen_http_h2_conn.streams),
+    {error, NewConn, application_error(connection_closed), Responses}.
+
+-spec handle_error(conn(), term()) ->
+    {error, conn(), gen_http:error_reason(), [h2_response()]}.
+handle_error(Conn, Reason) ->
+    NewConn = Conn#gen_http_h2_conn{state = closed},
+    Responses = generate_error_responses(Conn#gen_http_h2_conn.streams, Reason),
+    {error, NewConn, transport_error(Reason), Responses}.
+
+%%====================================================================
+%% Internal Functions - Utilities
+%%====================================================================
+
+-spec update_stream(conn(), stream_id(), stream_state()) -> conn().
+update_stream(Conn, StreamId, Stream) ->
+    Streams = maps:put(StreamId, Stream, Conn#gen_http_h2_conn.streams),
+    Conn#gen_http_h2_conn{streams = Streams}.
+
+-spec reactivate_socket_if_needed(module(), socket(), active | passive, conn()) -> ok.
+reactivate_socket_if_needed(Transport, Socket, active, #gen_http_h2_conn{state = open}) ->
+    Transport:setopts(Socket, [{active, once}]);
+reactivate_socket_if_needed(_, _, _, _) ->
+    ok.
+
+-spec generate_close_responses(#{stream_id() => stream_state()}) -> [h2_response()].
+generate_close_responses(Streams) ->
+    maps:fold(
+        fun(_Id, Stream, Acc) ->
+            case Stream#stream_state.state of
+                closed ->
+                    Acc;
+                _ ->
+                    [
+                        {error, Stream#stream_state.ref, Stream#stream_state.id, application_error(unexpected_close)}
+                        | Acc
+                    ]
+            end
+        end,
+        [],
+        Streams
+    ).
+
+-spec generate_error_responses(#{stream_id() => stream_state()}, term()) -> [h2_response()].
+generate_error_responses(Streams, Reason) ->
+    maps:fold(
+        fun(_Id, Stream, Acc) ->
+            [{error, Stream#stream_state.ref, Stream#stream_state.id, transport_error(Reason)} | Acc]
+        end,
+        [],
+        Streams
+    ).

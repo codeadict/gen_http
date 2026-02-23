@@ -12,3 +12,12 @@ _build
 .rebar
 compile_commands.json
 rebar3.crashdump
+_checkouts/
+
+# Docker volumes and test infrastructure
+caddy_data/
+caddy_config/
+caddy_storage/
+
+# Environment
+.env
