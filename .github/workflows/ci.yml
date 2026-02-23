@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: OTP ${{ matrix.otp }} / rebar3 ${{ matrix.rebar3 }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Latest - run all checks
+          - otp: '28.1'
+            rebar3: '3.24.0'
+            lint: true
+            dialyzer: true
+            coverage: true
+          # Stable
+          - otp: '27.2'
+            rebar3: '3.24.0'
+          # Minimum supported
+          - otp: '25.3'
+            rebar3: '3.23.0'
+
+    env:
+      DOCKER_USER: "${{ github.actor }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: ${{ matrix.rebar3 }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: _build/default/lib
+          key: deps-${{ runner.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            deps-${{ runner.os }}-otp-${{ matrix.otp }}-
+
+      - name: Cache PLTs
+        uses: actions/cache@v4
+        if: ${{ matrix.dialyzer }}
+        with:
+          path: _build/*/rebar3_*_plt
+          key: plt-${{ runner.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            plt-${{ runner.os }}-otp-${{ matrix.otp }}-
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Check formatting
+        if: ${{ matrix.lint }}
+        run: rebar3 fmt --check
+
+      - name: Run xref
+        if: ${{ matrix.lint }}
+        run: rebar3 xref
+
+      - name: Run dialyzer
+        if: ${{ matrix.dialyzer }}
+        run: rebar3 dialyzer
+
+      - name: Start docker services
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          timeout 30 sh -c 'until curl -s http://localhost:8080/get > /dev/null; do sleep 1; done'
+          timeout 30 sh -c 'until curl -k -s https://localhost:8443/get > /dev/null; do sleep 1; done'
+
+      - name: Run EUnit tests
+        run: rebar3 eunit --cover
+
+      - name: Run Common Test
+        id: ct
+        run: rebar3 ct --cover
+
+      - name: Run PropEr tests
+        run: rebar3 proper --cover
+
+      - name: Upload CT logs on failure
+        if: ${{ failure() && steps.ct.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-logs-otp-${{ matrix.otp }}
+          path: _build/test/logs
+
+      - name: Generate coverage report
+        if: ${{ matrix.coverage }}
+        run: rebar3 cover --verbose
+
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.coverage }}
+        uses: codecov/codecov-action@v4
+        with:
+          files: _build/test/cover/eunit.coverdata,_build/test/cover/ct.coverdata,_build/test/cover/proper.coverdata
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Stop docker services
+        if: always()
+        run: docker compose down
