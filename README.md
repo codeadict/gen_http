@@ -1,5 +1,7 @@
 # gen_http
 
+[![CI](https://github.com/codeadict/gen_http/actions/workflows/ci.yml/badge.svg)](https://github.com/codeadict/gen_http/actions/workflows/ci.yml)
+
 A minimal, low-level HTTP client for Erlang.
 
 HTTP/1.1 and HTTP/2 support. Pure Erlang. Zero dependencies.

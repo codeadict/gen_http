@@ -534,7 +534,6 @@ is_falsy(_) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-
 set_flags_test() ->
     ?assertEqual(
         16#01,
