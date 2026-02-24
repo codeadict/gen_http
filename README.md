@@ -20,7 +20,7 @@ Built to replace `httpc` with better performance and cleaner code.
 
 ## HTTP/2 Compliance
 
-✅ **156 compliance tests** covering RFC 7540 (HTTP/2) and RFC 7541 (HPACK)
+**156 compliance tests** covering RFC 7540 (HTTP/2) and RFC 7541 (HPACK)
 
 - Complete frame type validation (DATA, HEADERS, SETTINGS, PING, etc.)
 - Stream state machine verification
