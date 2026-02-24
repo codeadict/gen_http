@@ -4,9 +4,12 @@
 %%
 %% Protocol-agnostic functions that work with both gen_http_h1 and gen_http_h2.
 
-%% Compiler optimizations for hot-path functions
--compile(inline).
--compile({inline_size, 128}).
+%% Targeted inlining for small dispatch/wrapper helpers
+-compile(
+    {inline, [
+        normalize_h2_response/1
+    ]}
+).
 
 -include("include/gen_http.hrl").
 
