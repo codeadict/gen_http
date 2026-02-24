@@ -292,9 +292,8 @@ decode_string(<<Huffman:1, _:7, _/binary>> = Data) ->
             case gen_http_parser_huffman:decode(Encoded) of
                 {ok, Decoded} ->
                     {Decoded, Rest2};
-                {error, _Reason} ->
-                    %% Fall back to raw bytes if Huffman decode fails
-                    {Encoded, Rest2}
+                {error, Reason} ->
+                    throw({hpack_error, {huffman_decode_failed, Reason}})
             end
     end.
 
