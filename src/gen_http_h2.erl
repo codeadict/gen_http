@@ -138,18 +138,12 @@
     recv_window :: non_neg_integer(),
 
     %% Data
-    data_buffer = <<>> :: binary(),
     %% For CONTINUATION frames
     headers_buffer = <<>> :: binary(),
     %% Outbound data waiting for flow control window
     send_buffer = <<>> :: binary(),
     %% Whether END_STREAM should be sent after send_buffer drains
-    send_end_stream = false :: boolean(),
-
-    %% Priority (optional)
-    priority :: non_neg_integer() | undefined,
-    dependency :: stream_id() | undefined,
-    weight :: pos_integer() | undefined
+    send_end_stream = false :: boolean()
 }).
 
 -type conn() :: #gen_http_h2_conn{}.
@@ -424,7 +418,7 @@ get_window_size(Conn, StreamId) ->
 %% Attach metadata to connections (e.g., pool ID, metrics, tags).
 -spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
 put_private(#gen_http_h2_conn{private = Private} = Conn, Key, Value) ->
-    Conn#gen_http_h2_conn{private = maps:put(Key, Value, Private)}.
+    Conn#gen_http_h2_conn{private = Private#{Key => Value}}.
 
 %% @doc Get a private value from the connection.
 %%
@@ -873,7 +867,7 @@ handle_settings_frame(Conn, Flags, Params) ->
             %% Server sent SETTINGS, update and send ACK
             NewRemoteSettings = lists:foldl(
                 fun({Key, Value}, Acc) ->
-                    maps:put(Key, Value, Acc)
+                    Acc#{Key => Value}
                 end,
                 Conn#gen_http_h2_conn.remote_settings,
                 Params
@@ -1109,8 +1103,8 @@ handle_window_update_frame(Conn, StreamId, Increment) ->
 -spec flush_stream_send_buffer(conn(), stream_id()) ->
     {ok, conn(), [h2_response()]}.
 flush_stream_send_buffer(Conn, StreamId) ->
-    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
-        {ok, Stream} ->
+    case Conn#gen_http_h2_conn.streams of
+        #{StreamId := Stream} ->
             case Stream#stream_state.send_buffer of
                 <<>> ->
                     {ok, Conn, []};
@@ -1121,7 +1115,7 @@ flush_stream_send_buffer(Conn, StreamId) ->
                     ),
                     {ok, Conn2, []}
             end;
-        error ->
+        _ ->
             {ok, Conn, []}
     end.
 
@@ -1129,11 +1123,16 @@ flush_stream_send_buffer(Conn, StreamId) ->
 -spec flush_all_send_buffers(conn()) ->
     {ok, conn(), [h2_response()]}.
 flush_all_send_buffers(Conn) ->
-    StreamIds = [
-        Id
-     || {Id, S} <- maps:to_list(Conn#gen_http_h2_conn.streams),
-        byte_size(S#stream_state.send_buffer) > 0
-    ],
+    StreamIds = maps:fold(
+        fun(Id, S, Acc) ->
+            case byte_size(S#stream_state.send_buffer) > 0 of
+                true -> [Id | Acc];
+                false -> Acc
+            end
+        end,
+        [],
+        Conn#gen_http_h2_conn.streams
+    ),
     flush_streams(Conn, StreamIds).
 
 -spec flush_streams(conn(), [stream_id()]) -> {ok, conn(), [h2_response()]}.

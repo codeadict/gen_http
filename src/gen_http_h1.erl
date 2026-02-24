@@ -333,7 +333,7 @@ get_socket(#gen_http_h1_conn{socket = Socket}) ->
 %% Attach metadata to connections (e.g., pool ID, metrics, tags).
 -spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
 put_private(#gen_http_h1_conn{private = Private} = Conn, Key, Value) ->
-    Conn#gen_http_h1_conn{private = maps:put(Key, Value, Private)}.
+    Conn#gen_http_h1_conn{private = Private#{Key => Value}}.
 
 %% @doc Get a private value from the connection.
 %%
@@ -699,7 +699,6 @@ parse_headers(Buffer, ReqState, HeadersAcc) ->
             {error, protocol_error(invalid_header)}
     end.
 
--dialyzer({nowarn_function, handle_headers_complete/3}).
 handle_headers_complete(Rest, ReqState, Headers) ->
     HeadersResp = {headers, ReqState#request_state.ref, Headers},
     BodyState = determine_body_state(ReqState#request_state.status, Headers),

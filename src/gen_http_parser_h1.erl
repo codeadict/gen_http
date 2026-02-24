@@ -25,8 +25,8 @@
 -type header_name() :: binary().
 -type header_value() :: binary().
 
--define(IS_DIGIT(Val), Val >= $0 andalso Val =< $9).
--define(IS_ALPHA(Val), Val >= $A andalso Val =< $Z orelse Val >= $a andalso Val =< $z).
+-define(IS_DIGIT(Val), (Val >= $0 andalso Val =< $9)).
+-define(IS_ALPHA(Val), ((Val >= $A andalso Val =< $Z) orelse (Val >= $a andalso Val =< $z))).
 -define(IS_HEX(Val),
     (?IS_DIGIT(Val) orelse (Val >= $A andalso Val =< $F) orelse (Val >= $a andalso Val =< $f))
 ).
