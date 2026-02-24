@@ -128,7 +128,7 @@ send(Socket, Data) ->
     ssl:send(Socket, Data).
 
 %% @doc Close the SSL socket.
--spec close(socket()) -> ok.
+-spec close(socket()) -> ok | {error, term()}.
 close(Socket) ->
     ssl:close(Socket).
 

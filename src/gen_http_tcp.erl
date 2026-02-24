@@ -81,7 +81,7 @@ send(Socket, Data) ->
     gen_tcp:send(Socket, Data).
 
 %% @doc Close the TCP socket.
--spec close(socket()) -> ok.
+-spec close(socket()) -> ok | {error, term()}.
 close(Socket) ->
     gen_tcp:close(Socket).
 
