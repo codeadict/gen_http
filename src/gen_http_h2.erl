@@ -13,9 +13,21 @@
 %%
 %% Connection state is a pure data structure passed between function calls.
 
-%% Compiler optimizations for hot-path functions
--compile(inline).
--compile({inline_size, 128}).
+%% Targeted inlining for small hot-path helpers
+-compile(
+    {inline, [
+        is_open/1,
+        get_socket/1,
+        ensure_binary/1,
+        has_alpn_option/1,
+        server_max_frame_size/1,
+        max_header_block_size/1,
+        update_stream/3,
+        transport_error/1,
+        protocol_error/1,
+        application_error/1
+    ]}
+).
 
 -include("include/gen_http.hrl").
 -include("gen_http_h2_frames.hrl").
