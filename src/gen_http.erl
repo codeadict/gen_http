@@ -276,14 +276,16 @@ put_log(Conn, Log) when is_tuple(Conn) ->
 %% ```
 -spec request(conn(), binary(), binary(), headers(), iodata() | stream) ->
     {ok, conn(), reference()}
-    | {ok, conn(), reference(), pos_integer()}
     | {error, conn(), error_reason()}.
 request(Conn, Method, Path, Headers, Body) when is_tuple(Conn) ->
     case element(1, Conn) of
         gen_http_h1_conn ->
             gen_http_h1:request(Conn, Method, Path, Headers, Body);
         gen_http_h2_conn ->
-            gen_http_h2:request(Conn, Method, Path, Headers, Body)
+            case gen_http_h2:request(Conn, Method, Path, Headers, Body) of
+                {ok, Conn2, Ref, _StreamId} -> {ok, Conn2, Ref};
+                {error, _, _} = Error -> Error
+            end
     end.
 
 %% @doc Process incoming socket messages.
@@ -305,13 +307,22 @@ request(Conn, Method, Path, Headers, Body) when is_tuple(Conn) ->
 %% end.
 %% ```
 -spec stream(conn(), term()) ->
-    {ok, conn(), list()}
-    | {error, conn(), error_reason(), list()}
+    {ok, conn(), [response()]}
+    | {error, conn(), error_reason(), [response()]}
     | unknown.
 stream(Conn, Message) when is_tuple(Conn) ->
     case element(1, Conn) of
-        gen_http_h1_conn -> gen_http_h1:stream(Conn, Message);
-        gen_http_h2_conn -> gen_http_h2:stream(Conn, Message)
+        gen_http_h1_conn ->
+            gen_http_h1:stream(Conn, Message);
+        gen_http_h2_conn ->
+            case gen_http_h2:stream(Conn, Message) of
+                {ok, Conn2, Responses} ->
+                    {ok, Conn2, normalize_h2_responses(Responses)};
+                {error, Conn2, Reason, Responses} ->
+                    {error, Conn2, Reason, normalize_h2_responses(Responses)};
+                unknown ->
+                    unknown
+            end
     end.
 
 %% @doc Receive data from the connection in passive mode.
@@ -338,8 +349,15 @@ stream(Conn, Message) when is_tuple(Conn) ->
     {ok, conn(), [response()]} | {error, conn(), error_reason()}.
 recv(Conn, ByteCount, Timeout) when is_tuple(Conn) ->
     case element(1, Conn) of
-        gen_http_h1_conn -> gen_http_h1:recv(Conn, ByteCount, Timeout);
-        gen_http_h2_conn -> gen_http_h2:recv(Conn, ByteCount, Timeout)
+        gen_http_h1_conn ->
+            gen_http_h1:recv(Conn, ByteCount, Timeout);
+        gen_http_h2_conn ->
+            case gen_http_h2:recv(Conn, ByteCount, Timeout) of
+                {ok, Conn2, Responses} ->
+                    {ok, Conn2, normalize_h2_responses(Responses)};
+                {error, _, _} = Error ->
+                    Error
+            end
     end.
 
 %%====================================================================
@@ -535,6 +553,38 @@ negotiate_protocol(https, Address, Port, Opts, Protocols) ->
             gen_http_h1:connect(https, Address, Port, NewOpts)
     end.
 
+%% @doc Normalize HTTP/2 responses to the unified response() shape.
+%%
+%% HTTP/2 responses carry a stream_id that the unified interface strips.
+%% Headers responses also contain the :status pseudo-header which gets
+%% extracted as a separate {status, Ref, Status} event to match HTTP/1.
+-spec normalize_h2_responses([gen_http_h2:h2_response()]) -> [response()].
+normalize_h2_responses(Responses) ->
+    lists:flatmap(fun normalize_h2_response/1, Responses).
+
+-spec normalize_h2_response(gen_http_h2:h2_response()) -> [response()].
+normalize_h2_response({headers, Ref, _StreamId, Headers}) ->
+    %% Extract :status pseudo-header and emit as separate status event
+    case lists:keyfind(<<":status">>, 1, Headers) of
+        {<<":status">>, StatusBin} ->
+            Status = binary_to_integer(StatusBin),
+            CleanHeaders = [H || {K, _} = H <- Headers, K =/= <<":status">>],
+            [{status, Ref, Status}, {headers, Ref, CleanHeaders}];
+        false ->
+            %% No :status (shouldn't happen with well-formed responses)
+            CleanHeaders = [H || {K, _} = H <- Headers, K =/= <<":status">>],
+            [{headers, Ref, CleanHeaders}]
+    end;
+normalize_h2_response({data, Ref, _StreamId, Data}) ->
+    [{data, Ref, Data}];
+normalize_h2_response({done, Ref, _StreamId}) ->
+    [{done, Ref}];
+normalize_h2_response({error, Ref, _StreamId, Reason}) ->
+    [{error, Ref, Reason}];
+normalize_h2_response({push_promise, _Ref, _StreamId, _PromisedStreamId, _Headers} = PP) ->
+    %% Push promises are HTTP/2-specific, pass through as-is
+    [PP].
+
 %%====================================================================
 %% Unit Tests
 %%====================================================================
@@ -676,5 +726,54 @@ retry_logic_example_test() ->
 %% Helper function showing retry pattern
 should_retry(Error) ->
     is_retriable_error(Error).
+
+%%--------------------------------------------------------------------
+%% HTTP/2 Response Normalization Tests
+%%--------------------------------------------------------------------
+
+normalize_h2_headers_with_status_test() ->
+    Ref = make_ref(),
+    H2 = [{headers, Ref, 1, [{<<":status">>, <<"200">>}, {<<"content-type">>, <<"text/plain">>}]}],
+    Result = normalize_h2_responses(H2),
+    ?assertEqual(
+        [
+            {status, Ref, 200},
+            {headers, Ref, [{<<"content-type">>, <<"text/plain">>}]}
+        ],
+        Result
+    ).
+
+normalize_h2_data_test() ->
+    Ref = make_ref(),
+    H2 = [{data, Ref, 3, <<"hello">>}],
+    ?assertEqual([{data, Ref, <<"hello">>}], normalize_h2_responses(H2)).
+
+normalize_h2_done_test() ->
+    Ref = make_ref(),
+    H2 = [{done, Ref, 5}],
+    ?assertEqual([{done, Ref}], normalize_h2_responses(H2)).
+
+normalize_h2_error_test() ->
+    Ref = make_ref(),
+    H2 = [{error, Ref, 7, stream_closed}],
+    ?assertEqual([{error, Ref, stream_closed}], normalize_h2_responses(H2)).
+
+normalize_h2_full_response_test() ->
+    Ref = make_ref(),
+    H2 = [
+        {headers, Ref, 1, [{<<":status">>, <<"404">>}, {<<"server">>, <<"nginx">>}]},
+        {data, Ref, 1, <<"not found">>},
+        {done, Ref, 1}
+    ],
+    Result = normalize_h2_responses(H2),
+    ?assertEqual(
+        [
+            {status, Ref, 404},
+            {headers, Ref, [{<<"server">>, <<"nginx">>}]},
+            {data, Ref, <<"not found">>},
+            {done, Ref}
+        ],
+        Result
+    ).
 
 -endif.
