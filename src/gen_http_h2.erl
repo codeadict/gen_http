@@ -758,7 +758,7 @@ parse_frames(Conn, Acc) ->
         {ok, Frame, Rest} ->
             case handle_frame(Conn#gen_http_h2_conn{buffer = Rest}, Frame) of
                 {ok, NewConn, Responses} ->
-                    parse_frames(NewConn, Responses ++ Acc);
+                    parse_frames(NewConn, lists:reverse(Responses, Acc));
                 {error, NewConn, Reason} ->
                     {error, NewConn, Reason, Acc}
             end;
