@@ -155,7 +155,7 @@
 %% Default settings
 -define(DEFAULT_SETTINGS, #{
     header_table_size => 4096,
-    enable_push => true,
+    enable_push => false,
     max_concurrent_streams => 100,
     initial_window_size => ?DEFAULT_WINDOW_SIZE,
     max_frame_size => ?MAX_FRAME_SIZE,
