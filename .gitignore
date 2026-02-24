@@ -17,7 +17,7 @@ _checkouts/
 # Docker volumes and test infrastructure
 caddy_data/
 caddy_config/
-caddy_storage/
+.caddy_storage/
 
 # Environment
 .env

@@ -16,7 +16,7 @@ services:
       - HTTPBIN_HTTP_PORT=${HTTPBIN_HTTP_PORT:-8080}
       - HTTPBIN_HTTPS_PORT=${HTTPBIN_HTTPS_PORT:-8443}
     volumes:
-      - "./caddy_storage:/caddy_storage"
+      - "../../.caddy_storage:/caddy_storage"
     ports:
       - "${HTTPBIN_HTTPS_PORT:-8443}:${HTTPBIN_HTTPS_PORT:-8443}"
     depends_on:

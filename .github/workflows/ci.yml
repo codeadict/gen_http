@@ -70,6 +70,11 @@ jobs:
         if: ${{ matrix.dialyzer }}
         run: rebar3 dialyzer
 
+      - name: Clean test volumes
+        run: |
+          # Remove any leftover Docker volumes that may cause permission issues
+          rm -rf .caddy_storage test/support/caddy_storage || true
+
       - name: Start docker services
         run: docker compose -f test/support/docker-compose.yml up -d
 
