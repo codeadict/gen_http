@@ -25,9 +25,16 @@
 -record(hpack_context, {
     max_table_size = 4096 :: non_neg_integer(),
     table_size = 0 :: non_neg_integer(),
-    table = [] :: [header()],
-    % Static table is 1-61
-    next_index = 62 :: pos_integer()
+    %% Monotonic counters for O(1) FIFO queue semantics.
+    %% Active entries have IDs in [drop_count, insert_count - 1].
+    insert_count = 0 :: non_neg_integer(),
+    drop_count = 0 :: non_neg_integer(),
+    %% entry_id -> {header(), entry_byte_size}
+    entries = #{} :: #{non_neg_integer() => {header(), non_neg_integer()}},
+    %% {Name, Value} -> entry_id (newest wins)
+    by_header = #{} :: #{{binary(), binary()} => non_neg_integer()},
+    %% Name -> entry_id (newest wins)
+    by_name = #{} :: #{binary() => non_neg_integer()}
 }).
 
 -type context() :: #hpack_context{}.
@@ -47,8 +54,11 @@ new(MaxSize) ->
     #hpack_context{
         max_table_size = MaxSize,
         table_size = 0,
-        table = [],
-        next_index = 62
+        insert_count = 0,
+        drop_count = 0,
+        entries = #{},
+        by_header = #{},
+        by_name = #{}
     }.
 
 %% @doc Encode headers to HPACK binary format.
@@ -302,54 +312,59 @@ decode_string(<<Huffman:1, _:7, _/binary>> = Data) ->
 %%====================================================================
 
 -spec add_to_table(header(), context()) -> context().
-add_to_table(Header, Context) ->
+add_to_table({Name, Value} = Header, Context) ->
     #hpack_context{
-        max_table_size = MaxSize,
-        table_size = CurrentSize,
-        table = Table
+        insert_count = IC,
+        entries = Entries,
+        by_header = ByHeader,
+        by_name = ByName,
+        table_size = CurrentSize
     } = Context,
 
     EntrySize = header_size(Header),
-    NewTable = [Header | Table],
-    NewSize = CurrentSize + EntrySize,
-
     NewContext = Context#hpack_context{
-        table = NewTable,
-        table_size = NewSize
+        insert_count = IC + 1,
+        entries = Entries#{IC => {Header, EntrySize}},
+        by_header = ByHeader#{{Name, Value} => IC},
+        by_name = ByName#{Name => IC},
+        table_size = CurrentSize + EntrySize
     },
-
-    %% Evict entries if over max size
-    case NewSize > MaxSize of
-        true -> evict_to_fit(NewContext);
-        false -> NewContext
-    end.
+    evict_to_fit(NewContext).
 
 -spec evict_to_fit(context()) -> context().
+evict_to_fit(#hpack_context{table_size = Size, max_table_size = Max} = Ctx) when Size =< Max ->
+    Ctx;
+evict_to_fit(#hpack_context{insert_count = IC, drop_count = DC} = Ctx) when IC =:= DC ->
+    Ctx;
 evict_to_fit(Context) ->
     #hpack_context{
-        max_table_size = MaxSize,
-        table_size = CurrentSize,
-        table = Table
+        drop_count = DC,
+        entries = Entries,
+        by_header = ByHeader,
+        by_name = ByName,
+        table_size = CurrentSize
     } = Context,
 
-    case CurrentSize > MaxSize of
-        false ->
-            Context;
-        true ->
-            %% Remove oldest entry (last in list)
-            case lists:reverse(Table) of
-                [] ->
-                    Context;
-                [Oldest | RestReversed] ->
-                    NewTable = lists:reverse(RestReversed),
-                    NewSize = CurrentSize - header_size(Oldest),
-                    NewContext = Context#hpack_context{
-                        table = NewTable,
-                        table_size = NewSize
-                    },
-                    evict_to_fit(NewContext)
-            end
-    end.
+    %% Evict oldest entry (lowest ID)
+    {{Name, Value}, EntrySize} = maps:get(DC, Entries),
+    NewByHeader =
+        case maps:get({Name, Value}, ByHeader, undefined) of
+            DC -> maps:remove({Name, Value}, ByHeader);
+            _ -> ByHeader
+        end,
+    NewByName =
+        case maps:get(Name, ByName, undefined) of
+            DC -> maps:remove(Name, ByName);
+            _ -> ByName
+        end,
+    NewContext = Context#hpack_context{
+        drop_count = DC + 1,
+        entries = maps:remove(DC, Entries),
+        by_header = NewByHeader,
+        by_name = NewByName,
+        table_size = CurrentSize - EntrySize
+    },
+    evict_to_fit(NewContext).
 
 -spec header_size(header()) -> non_neg_integer().
 header_size({Name, Value}) ->
@@ -358,14 +373,12 @@ header_size({Name, Value}) ->
 
 -spec get_indexed_header(pos_integer(), context()) -> header().
 get_indexed_header(Index, _Context) when Index >= 1, Index =< 61 ->
-    %% Static table
     static_table_entry(Index);
-get_indexed_header(Index, Context) when Index >= 62 ->
-    %% Dynamic table (1-indexed from 62)
-    DynamicIndex = Index - 62,
-    case lists:nth(DynamicIndex + 1, Context#hpack_context.table) of
-        Header -> Header
-    end.
+get_indexed_header(Index, #hpack_context{insert_count = IC, entries = Entries}) when Index >= 62 ->
+    %% Newest entry = index 62, so entry_id = IC - 1 - (Index - 62)
+    EntryId = IC + 61 - Index,
+    {Header, _Size} = maps:get(EntryId, Entries),
+    Header.
 
 %%====================================================================
 %% Internal Functions - Static Table Lookups
@@ -392,23 +405,18 @@ lookup_static_name(Name) ->
     end.
 
 -spec lookup_dynamic_full(binary(), binary(), context()) -> {ok, pos_integer()} | not_found.
-lookup_dynamic_full(Name, Value, Context) ->
-    lookup_dynamic_helper(Name, Value, Context#hpack_context.table, 62, full).
+lookup_dynamic_full(Name, Value, #hpack_context{by_header = ByHeader, insert_count = IC}) ->
+    case maps:get({Name, Value}, ByHeader, not_found) of
+        not_found -> not_found;
+        EntryId -> {ok, IC + 61 - EntryId}
+    end.
 
 -spec lookup_dynamic_name(binary(), context()) -> {ok, pos_integer()} | not_found.
-lookup_dynamic_name(Name, Context) ->
-    lookup_dynamic_helper(Name, undefined, Context#hpack_context.table, 62, name_only).
-
--spec lookup_dynamic_helper(binary(), binary() | undefined, [header()], pos_integer(), full | name_only) ->
-    {ok, pos_integer()} | not_found.
-lookup_dynamic_helper(_Name, _Value, [], _Index, _Mode) ->
-    not_found;
-lookup_dynamic_helper(Name, Value, [{Name, Value} | _], Index, full) ->
-    {ok, Index};
-lookup_dynamic_helper(Name, _Value, [{Name, _} | _], Index, name_only) ->
-    {ok, Index};
-lookup_dynamic_helper(Name, Value, [_ | Rest], Index, Mode) ->
-    lookup_dynamic_helper(Name, Value, Rest, Index + 1, Mode).
+lookup_dynamic_name(Name, #hpack_context{by_name = ByName, insert_count = IC}) ->
+    case maps:get(Name, ByName, not_found) of
+        not_found -> not_found;
+        EntryId -> {ok, IC + 61 - EntryId}
+    end.
 
 %%====================================================================
 %% Static Table (RFC 7541 Appendix A)
@@ -567,10 +575,10 @@ static_table_lookup_name() ->
 
 new_context_test() ->
     Context = gen_http_parser_hpack:new(),
-    ?assert(is_record(Context, hpack_context, 5)),
+    ?assert(is_record(Context, hpack_context, 8)),
 
     Context2 = gen_http_parser_hpack:new(8192),
-    ?assert(is_record(Context2, hpack_context, 5)).
+    ?assert(is_record(Context2, hpack_context, 8)).
 
 encode_decode_roundtrip_test() ->
     Headers = [
@@ -688,7 +696,7 @@ table_size_update_test() ->
 
     %% Resize to smaller size
     NewContext = gen_http_parser_hpack:resize_table(Context, 2048),
-    ?assert(is_record(NewContext, hpack_context, 5)),
+    ?assert(is_record(NewContext, hpack_context, 8)),
 
     %% Verify new size is set
     {ok, _, _} = gen_http_parser_hpack:encode([], NewContext).
@@ -712,7 +720,7 @@ eviction_test() ->
     ?assertEqual(Headers, Decoded),
 
     %% But not all headers may be in dynamic table due to eviction
-    ?assert(is_record(EncContext, hpack_context, 5)).
+    ?assert(is_record(EncContext, hpack_context, 8)).
 
 empty_headers_test() ->
     Context = gen_http_parser_hpack:new(),
