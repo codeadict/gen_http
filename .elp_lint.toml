@@ -1,0 +1,4 @@
+disabled_lints = [
+    'W0038', # EDoc style comments are deprecated.
+    'W0051' # Binary string can be written using sigil syntax.
+]
