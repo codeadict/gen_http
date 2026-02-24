@@ -35,14 +35,14 @@ encode(
     } = _Frame
 ) ->
     {Payload, Flags1} =
-        case is_falsy(StreamDep) andalso is_falsy(Weight) andalso is_boolean(IsExclusive) of
+        case (not is_falsy(StreamDep)) andalso (not is_falsy(Weight)) of
             true ->
-                IsExclussiveInt = boolean_to_integer(IsExclusive),
+                ExclusiveBit = boolean_to_integer(IsExclusive =:= true),
                 {
-                    [<<IsExclussiveInt:1, StreamDep:31>>, Weight - 1, Hbf],
+                    [<<ExclusiveBit:1, StreamDep:31>>, Weight - 1, Hbf],
                     set_flags(Flags, headers, [priority])
                 };
-            _Other ->
+            false ->
                 {Hbf, Flags}
         end,
 
