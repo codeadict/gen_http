@@ -94,7 +94,7 @@ init_per_suite(Config) ->
             ct:pal("Docker services are available"),
             Config;
         false ->
-            {skip, "Docker services not available. Run: docker-compose up -d"}
+            {skip, "Docker services not available. Run: docker compose -f test/support/docker-compose.yml up -d"}
     end.
 
 end_per_suite(_Config) ->

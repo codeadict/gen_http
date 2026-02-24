@@ -68,7 +68,7 @@ init_per_testcase(TestCase, Config) when
         true ->
             Config;
         false ->
-            {skip, "Docker services not available. Run: docker-compose up -d"}
+            {skip, "Docker services not available. Run: docker compose -f test/support/docker-compose.yml up -d"}
     end;
 init_per_testcase(_TestCase, Config) ->
     Config.

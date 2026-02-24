@@ -24,13 +24,13 @@ The test infrastructure uses:
 
 ```bash
 # Start the test servers
-docker-compose up -d
+docker compose -f test/support/docker-compose.yml up -d
 
 # Check servers are healthy
-docker-compose ps
+docker compose -f test/support/docker-compose.yml ps
 
 # View logs if needed
-docker-compose logs -f
+docker compose -f test/support/docker-compose.yml logs -f
 ```
 
 ### 2. Run Tests
@@ -39,21 +39,28 @@ docker-compose logs -f
 # Run all unit tests
 rebar3 eunit
 
+# Run Common Test integration tests (requires docker servers)
+rebar3 ct
+
 # Run property-based tests
-rebar3 as test proper
+rebar3 proper
 
 # Run all tests
-rebar3 do eunit, as test proper
+rebar3 test
+
+# Run HTTP/2 compliance tests (excluded by default - slow, requires special setup)
+# Note: This requires the h2-test-harness-patched Docker image to be built
+rebar3 ct --suite=h2_compliance_SUITE
 ```
 
 ### 3. Stop Test Infrastructure
 
 ```bash
 # Stop and remove containers
-docker-compose down
+docker compose -f test/support/docker-compose.yml down
 
 # Stop and remove containers + volumes
-docker-compose down -v
+docker compose -f test/support/docker-compose.yml down -v
 ```
 
 ## Test Server Endpoints
@@ -88,8 +95,8 @@ HTTPBIN_HTTPS_PORT=8443
 
 If tests are being skipped with "Test server not available", ensure:
 
-1. Docker Compose is running: `docker-compose ps`
-2. Services are healthy: `docker-compose ps` (should show "healthy")
+1. Docker Compose is running: `docker compose -f test/support/docker-compose.yml ps`
+2. Services are healthy: `docker compose -f test/support/docker-compose.yml ps` (should show "healthy")
 3. Ports are accessible: `curl http://localhost:8080/get`
 
 ### Port conflicts
@@ -113,6 +120,11 @@ The Caddy server uses self-signed certificates for local testing. Tests should u
 ## Test Structure
 
 - `test_helper.erl` - Common test utilities and server configuration
-- `*_test.erl` - Unit tests for individual modules
-- `*_integration_test.erl` - Integration tests that use the test server
+- `*_SUITE.erl` - Common Test suites (integration tests)
+  - `features_SUITE.erl` - Feature tests
+  - `http1_SUITE.erl` - HTTP/1.1 protocol tests
+  - `http2_SUITE.erl` - HTTP/2 protocol tests
+  - `ssl_SUITE.erl` - SSL/TLS tests
+  - `unified_SUITE.erl` - Unified API tests
+  - `h2_compliance_SUITE.erl` - HTTP/2 RFC compliance (excluded by default)
 - `prop_*.erl` - Property-based tests using PropEr

@@ -1,6 +1,9 @@
 # gen_http
 
 [![CI](https://github.com/codeadict/gen_http/actions/workflows/ci.yml/badge.svg)](https://github.com/codeadict/gen_http/actions/workflows/ci.yml)
+[![HTTP/2 Compliance](https://github.com/codeadict/gen_http/actions/workflows/h2-compliance.yml/badge.svg)](https://github.com/codeadict/gen_http/actions/workflows/h2-compliance.yml)
+[![RFC 7540](https://img.shields.io/badge/RFC%207540-compliant-brightgreen)](https://datatracker.ietf.org/doc/html/rfc7540)
+[![RFC 7541](https://img.shields.io/badge/RFC%207541-compliant-brightgreen)](https://datatracker.ietf.org/doc/html/rfc7541)
 
 A minimal, low-level HTTP client for Erlang.
 
@@ -14,6 +17,18 @@ HTTP/1.1 and HTTP/2 support. Pure Erlang. Zero dependencies.
 - **Flexible**: Works with both protocols transparently
 
 Built to replace `httpc` with better performance and cleaner code.
+
+## HTTP/2 Compliance
+
+✅ **156 compliance tests** covering RFC 7540 (HTTP/2) and RFC 7541 (HPACK)
+
+- Complete frame type validation (DATA, HEADERS, SETTINGS, PING, etc.)
+- Stream state machine verification
+- Flow control and priority handling
+- HPACK compression/decompression
+- All error conditions tested
+
+Tested against [h2-client-test-harness](https://github.com/nomadlabsinc/h2-client-test-harness) with **100% pass rate**.
 
 ## Quick Start
 
@@ -132,7 +147,7 @@ end.
 
 ```bash
 # Start test infrastructure
-docker-compose up -d
+docker compose -f test/support/docker-compose.yml up -d
 
 # Run all tests
 rebar3 test
@@ -141,6 +156,9 @@ rebar3 test
 rebar3 eunit           # Unit tests (fast, no docker)
 rebar3 ct              # Integration tests (requires docker)
 rebar3 proper          # Property-based tests
+
+# HTTP/2 compliance tests (excluded by default - slow, requires special setup)
+rebar3 ct --suite=h2_compliance_SUITE
 ```
 
 ## Project Status

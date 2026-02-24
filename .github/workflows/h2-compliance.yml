@@ -1,0 +1,80 @@
+name: HTTP/2 Compliance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  h2spec_compliance:
+    name: HTTP/2 Compliance (h2-client-test-harness)
+    runs-on: ubuntu-latest
+
+    env:
+      OTP_VERSION: '28.1'
+      REBAR3_VERSION: '3.24.0'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: _build/default/lib
+          key: deps-${{ runner.os }}-otp-${{ env.OTP_VERSION }}-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            deps-${{ runner.os }}-otp-${{ env.OTP_VERSION }}-
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Build h2-test-harness-patched Docker image
+        run: |
+          docker build -t h2-test-harness-patched:latest -f test/support/Dockerfile.h2-harness-patched .
+
+      - name: Verify Docker image
+        run: |
+          docker images | grep h2-test-harness-patched
+          echo "✓ Patched harness image built successfully"
+
+      - name: Run HTTP/2 compliance tests
+        id: h2_compliance
+        run: |
+          # Tests will manage their own container lifecycle
+          rebar3 ct --suite=h2_compliance_SUITE --verbose
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          chmod +x test/support/generate_compliance_summary.sh
+          ./test/support/generate_compliance_summary.sh _build/test/logs
+
+      - name: Upload compliance test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2-compliance-logs-otp-${{ env.OTP_VERSION }}
+          path: _build/test/logs
+
+      - name: Cleanup test containers
+        if: always()
+        run: |
+          # Clean up any leftover test containers
+          docker ps -a | grep gen_http_h2_test | awk '{print $1}' | xargs docker rm -f || true
+
+      - name: Check compliance test results
+        if: ${{ steps.h2_compliance.outcome == 'failure' }}
+        run: |
+          echo "⚠️  HTTP/2 compliance tests failed"
+          echo "Review logs to identify issues"
+          exit 1

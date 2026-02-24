@@ -27,20 +27,20 @@ xref: ## Run cross-reference analysis
 # Test server management
 server-start: ## Start test server (Docker Compose)
 	@echo "Starting test server..."
-	docker-compose up -d
+	docker compose -f test/support/docker-compose.yml up -d
 	@echo "Waiting for services to be healthy..."
-	@timeout 30 sh -c 'until docker-compose ps | grep -q "(healthy)"; do sleep 1; done' || \
+	@timeout 30 sh -c 'until docker compose -f test/support/docker-compose.yml ps | grep -q "(healthy)"; do sleep 1; done' || \
 		(echo "Timeout waiting for services" && exit 1)
 	@echo "✓ Test server ready at http://localhost:8080 and https://localhost:8443"
 
 server-stop: ## Stop test server
-	docker-compose down
+	docker compose -f test/support/docker-compose.yml down
 
 server-status: ## Show test server status
-	docker-compose ps
+	docker compose -f test/support/docker-compose.yml ps
 
 server-logs: ## Show test server logs
-	docker-compose logs -f
+	docker compose -f test/support/docker-compose.yml logs -f
 
 server-health: ## Check if test server is healthy
 	@curl -sf http://localhost:8080/status/200 > /dev/null && \
