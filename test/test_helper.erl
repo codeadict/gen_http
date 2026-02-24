@@ -48,7 +48,7 @@ https_port() ->
 skip_if_no_server() ->
     case is_server_available() of
         true -> ok;
-        false -> {skip, "Test server not available. Run: docker-compose up -d"}
+        false -> {skip, "Test server not available. Run: docker compose -f test/support/docker-compose.yml up -d"}
     end.
 
 %% @doc Check if local test server is available.

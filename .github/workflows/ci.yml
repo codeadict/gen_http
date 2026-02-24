@@ -71,7 +71,7 @@ jobs:
         run: rebar3 dialyzer
 
       - name: Start docker services
-        run: docker compose up -d
+        run: docker compose -f test/support/docker-compose.yml up -d
 
       - name: Wait for services
         run: |
@@ -109,4 +109,4 @@ jobs:
 
       - name: Stop docker services
         if: always()
-        run: docker compose down
+        run: docker compose -f test/support/docker-compose.yml down

@@ -1,0 +1,36 @@
+# Build h2-test-harness from source with patched bind address
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /build
+
+# Install dependencies
+RUN apk add --no-cache git openssl
+
+# Clone the repository
+RUN git clone https://github.com/nomadlabsinc/h2-client-test-harness.git .
+
+# Patch the bind address from 127.0.0.1 to 0.0.0.0
+# This allows Docker port forwarding to work
+RUN find . -type f -name "*.go" -exec sed -i 's/127\.0\.0\.1:8080/0.0.0.0:8080/g' {} \;
+
+# Build the binaries
+RUN go mod download
+RUN go build -o /h2-client-test-harness main.go
+RUN go build -o /h2-verifier cmd/verifier/main.go
+
+# Final image
+FROM alpine:latest
+
+WORKDIR /
+
+# Install runtime dependencies
+RUN apk add --no-cache openssl ca-certificates
+
+# Copy binaries from builder
+COPY --from=builder /h2-client-test-harness /h2-client-test-harness
+COPY --from=builder /h2-verifier /h2-verifier
+
+# Expose the port
+EXPOSE 8080
+
+ENTRYPOINT ["/h2-client-test-harness"]
