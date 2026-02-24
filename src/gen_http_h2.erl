@@ -1031,7 +1031,7 @@ handle_continuation_frame(Conn, StreamId, #continuation{flags = Flags, hbf = Hea
 -spec transport_error(term()) -> gen_http:error_reason().
 transport_error(closed) -> {transport_error, closed};
 transport_error(timeout) -> {transport_error, timeout};
-transport_error(econnrefused) -> {transport_error, econnreset};
+transport_error(econnrefused) -> {transport_error, econnrefused};
 transport_error(econnreset) -> {transport_error, econnreset};
 transport_error(ehostunreach) -> {transport_error, ehostunreach};
 transport_error(enetunreach) -> {transport_error, enetunreach};
