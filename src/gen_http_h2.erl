@@ -101,6 +101,9 @@
     %% Connection preface sent
     preface_sent = false :: boolean(),
 
+    %% Buffer limit (default 1MB)
+    max_buffer_size = 1048576 :: pos_integer(),
+
     %% Logging
     log = false :: boolean(),
 
@@ -180,6 +183,7 @@ connect(Scheme, Address, Port, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     Mode = maps:get(mode, Opts, active),
     MaxConcurrent = maps:get(max_concurrent, Opts, 100),
+    MaxBufferSize = maps:get(max_buffer_size, Opts, 1048576),
 
     TransportOpts = maps:get(transport_opts, Opts, []),
 
@@ -213,6 +217,7 @@ connect(Scheme, Address, Port, Opts) ->
             scheme = Scheme,
             mode = Mode,
             max_concurrent = MaxConcurrent,
+            max_buffer_size = MaxBufferSize,
             hpack_encode = HpackEncode,
             hpack_decode = HpackDecode,
             initial_window_size = ?DEFAULT_WINDOW_SIZE,
@@ -740,15 +745,25 @@ send_all_data(Conn, StreamId, Data) ->
 -spec handle_data(conn(), binary()) ->
     {ok, conn(), [h2_response()]} | {error, conn(), term(), [h2_response()]}.
 handle_data(Conn, Data) ->
-    #gen_http_h2_conn{buffer = Buffer, mode = Mode, transport = Transport, socket = Socket} = Conn,
+    #gen_http_h2_conn{
+        buffer = Buffer,
+        mode = Mode,
+        transport = Transport,
+        socket = Socket,
+        max_buffer_size = MaxBuf
+    } = Conn,
     NewBuffer = <<Buffer/binary, Data/binary>>,
-
-    case parse_frames(Conn#gen_http_h2_conn{buffer = NewBuffer}, []) of
-        {ok, NewConn, Responses} ->
-            reactivate_socket_if_needed(Transport, Socket, Mode, NewConn),
-            {ok, NewConn, lists:reverse(Responses)};
-        {error, NewConn, Reason, Responses} ->
-            {error, NewConn, Reason, lists:reverse(Responses)}
+    case byte_size(NewBuffer) > MaxBuf of
+        true ->
+            {error, Conn, {application_error, buffer_overflow}, []};
+        false ->
+            case parse_frames(Conn#gen_http_h2_conn{buffer = NewBuffer}, []) of
+                {ok, NewConn, Responses} ->
+                    reactivate_socket_if_needed(Transport, Socket, Mode, NewConn),
+                    {ok, NewConn, lists:reverse(Responses)};
+                {error, NewConn, Reason, Responses} ->
+                    {error, NewConn, Reason, lists:reverse(Responses)}
+            end
     end.
 
 -spec parse_frames(conn(), [h2_response()]) ->
