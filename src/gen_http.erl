@@ -534,7 +534,7 @@ negotiate_protocol(https, Address, Port, Opts, Protocols) ->
     %% Add ALPN to transport options
     TransportOpts = maps:get(transport_opts, Opts, []),
     NewTransportOpts = [{alpn_advertise, AlpnProtocols} | TransportOpts],
-    NewOpts = maps:put(transport_opts, NewTransportOpts, Opts),
+    NewOpts = Opts#{transport_opts => NewTransportOpts},
 
     %% Try HTTP/2 first if in protocol list
     case lists:member(http2, Protocols) of
