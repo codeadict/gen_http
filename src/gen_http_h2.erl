@@ -149,6 +149,8 @@
 -define(MAX_FRAME_SIZE, 16384).
 %% Cap accumulated header block size to prevent CONTINUATION flood (CVE-2024-27316)
 -define(MAX_HEADER_BLOCK_SIZE, 65536).
+%% RFC 7540 Section 6.9.1: flow control window must not exceed 2^31-1
+-define(MAX_WINDOW_SIZE, 2147483647).
 
 %% Default settings
 -define(DEFAULT_SETTINGS, #{
@@ -828,43 +830,48 @@ handle_settings_frame(Conn, Flags, Params) ->
             ),
 
             %% If initial_window_size changed, update all streams
-            Conn2 =
+            Result =
                 case lists:keyfind(initial_window_size, 1, Params) of
                     {initial_window_size, NewWindowSize} ->
                         OldWindowSize = Conn#gen_http_h2_conn.initial_window_size,
                         Delta = NewWindowSize - OldWindowSize,
                         update_all_stream_windows(Conn, Delta);
                     false ->
-                        Conn
+                        {ok, Conn}
                 end,
 
-            %% If header_table_size changed, update HPACK contexts
-            Conn3 =
-                case lists:keyfind(header_table_size, 1, Params) of
-                    {header_table_size, NewTableSize} ->
-                        HpackEncode = Conn2#gen_http_h2_conn.hpack_encode,
-                        HpackDecode = Conn2#gen_http_h2_conn.hpack_decode,
-                        HpackEncode2 = gen_http_parser_hpack:resize_table(HpackEncode, NewTableSize),
-                        HpackDecode2 = gen_http_parser_hpack:resize_table(HpackDecode, NewTableSize),
-                        Conn2#gen_http_h2_conn{
-                            hpack_encode = HpackEncode2,
-                            hpack_decode = HpackDecode2
-                        };
-                    false ->
-                        Conn2
-                end,
+            case Result of
+                {error, _, _} = Err ->
+                    Err;
+                {ok, Conn2} ->
+                    %% If header_table_size changed, update HPACK contexts
+                    Conn3 =
+                        case lists:keyfind(header_table_size, 1, Params) of
+                            {header_table_size, NewTableSize} ->
+                                HpackEncode = Conn2#gen_http_h2_conn.hpack_encode,
+                                HpackDecode = Conn2#gen_http_h2_conn.hpack_decode,
+                                HpackEncode2 = gen_http_parser_hpack:resize_table(HpackEncode, NewTableSize),
+                                HpackDecode2 = gen_http_parser_hpack:resize_table(HpackDecode, NewTableSize),
+                                Conn2#gen_http_h2_conn{
+                                    hpack_encode = HpackEncode2,
+                                    hpack_decode = HpackDecode2
+                                };
+                            false ->
+                                Conn2
+                        end,
 
-            Conn4 = Conn3#gen_http_h2_conn{remote_settings = NewRemoteSettings},
+                    Conn4 = Conn3#gen_http_h2_conn{remote_settings = NewRemoteSettings},
 
-            %% Send SETTINGS ACK
-            AckFrame = #settings{
-                stream_id = 0,
-                flags = gen_http_parser_h2:set_flags(0, settings, [ack]),
-                params = []
-            },
-            Conn5 = send_frame(Conn4, AckFrame),
+                    %% Send SETTINGS ACK
+                    AckFrame = #settings{
+                        stream_id = 0,
+                        flags = gen_http_parser_h2:set_flags(0, settings, [ack]),
+                        params = []
+                    },
+                    Conn5 = send_frame(Conn4, AckFrame),
 
-            {ok, Conn5, []}
+                    {ok, Conn5, []}
+            end
     end.
 
 %% @doc Handle HEADERS frame (response headers).
@@ -1024,21 +1031,27 @@ handle_data_frame(Conn, StreamId, #data{flags = Flags, data = Data}) ->
 -spec handle_window_update_frame(conn(), stream_id(), non_neg_integer()) ->
     {ok, conn(), [h2_response()]} | {error, conn(), term()}.
 handle_window_update_frame(Conn, 0, Increment) ->
-    %% Connection-level window update -- flush all streams with buffered data
-    NewConn = Conn#gen_http_h2_conn{
-        send_window = Conn#gen_http_h2_conn.send_window + Increment
-    },
-    flush_all_send_buffers(NewConn);
+    NewWindow = Conn#gen_http_h2_conn.send_window + Increment,
+    case NewWindow > ?MAX_WINDOW_SIZE of
+        true ->
+            {error, Conn, protocol_error({flow_control_error, connection_window_overflow})};
+        false ->
+            NewConn = Conn#gen_http_h2_conn{send_window = NewWindow},
+            flush_all_send_buffers(NewConn)
+    end;
 handle_window_update_frame(Conn, StreamId, Increment) ->
-    %% Stream-level window update
     case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
         {ok, Stream} ->
             NewWindow = Stream#stream_state.send_window + Increment,
-            NewStream = Stream#stream_state{send_window = NewWindow},
-            Conn2 = update_stream(Conn, StreamId, NewStream),
-            flush_stream_send_buffer(Conn2, StreamId);
+            case NewWindow > ?MAX_WINDOW_SIZE of
+                true ->
+                    {error, Conn, protocol_error({flow_control_error, stream_window_overflow})};
+                false ->
+                    NewStream = Stream#stream_state{send_window = NewWindow},
+                    Conn2 = update_stream(Conn, StreamId, NewStream),
+                    flush_stream_send_buffer(Conn2, StreamId)
+            end;
         error ->
-            %% Unknown stream, ignore
             {ok, Conn, []}
     end.
 
@@ -1204,9 +1217,11 @@ transport_error(Other) -> {transport_error, Other}.
     max_concurrent_streams_exceeded
     | {frame_parse_error, term()}
     | {hpack_decode_error, term()}
+    | {flow_control_error, term()}
 ) -> gen_http:error_reason().
 protocol_error({frame_parse_error, _} = E) -> {protocol_error, E};
 protocol_error({hpack_decode_error, _} = E) -> {protocol_error, E};
+protocol_error({flow_control_error, _} = E) -> {protocol_error, E};
 protocol_error(max_concurrent_streams_exceeded) -> {protocol_error, max_concurrent_streams_exceeded}.
 
 %% @doc Wrap application errors in structured format.
@@ -1244,16 +1259,25 @@ remove_pseudo_headers(Headers) ->
         Headers
     ).
 
--spec update_all_stream_windows(conn(), integer()) -> conn().
+-spec update_all_stream_windows(conn(), integer()) ->
+    {ok, conn()} | {error, conn(), term()}.
 update_all_stream_windows(Conn, Delta) ->
-    NewStreams = maps:map(
-        fun(_Id, Stream) ->
-            OldWindow = Stream#stream_state.send_window,
-            Stream#stream_state{send_window = OldWindow + Delta}
-        end,
-        Conn#gen_http_h2_conn.streams
-    ),
-    Conn#gen_http_h2_conn{streams = NewStreams}.
+    try
+        NewStreams = maps:map(
+            fun(_Id, Stream) ->
+                NewWindow = Stream#stream_state.send_window + Delta,
+                case NewWindow > ?MAX_WINDOW_SIZE of
+                    true -> throw(window_overflow);
+                    false -> Stream#stream_state{send_window = NewWindow}
+                end
+            end,
+            Conn#gen_http_h2_conn.streams
+        ),
+        {ok, Conn#gen_http_h2_conn{streams = NewStreams}}
+    catch
+        throw:window_overflow ->
+            {error, Conn, protocol_error({flow_control_error, settings_window_overflow})}
+    end.
 
 %%====================================================================
 %% Internal Functions - Connection Close
