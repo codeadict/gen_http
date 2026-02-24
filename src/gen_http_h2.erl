@@ -191,6 +191,16 @@ connect(Scheme, Address, Port) ->
 -spec connect(scheme(), address(), inet:port_number(), map()) ->
     {ok, conn()} | {error, term()}.
 connect(Scheme, Address, Port, Opts) ->
+    case validate_opts(Opts) of
+        ok ->
+            connect_impl(Scheme, Address, Port, Opts);
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec connect_impl(scheme(), address(), inet:port_number(), map()) ->
+    {ok, conn()} | {error, term()}.
+connect_impl(Scheme, Address, Port, Opts) ->
     Transport = gen_http_transport:module_for_scheme(Scheme),
     Timeout = maps:get(timeout, Opts, 5000),
     Mode = maps:get(mode, Opts, active),
@@ -436,6 +446,15 @@ delete_private(#gen_http_h2_conn{private = Private} = Conn, Key) ->
 %%====================================================================
 %% Internal Functions - Connection Setup
 %%====================================================================
+
+-define(VALID_OPTS, [timeout, mode, max_concurrent, max_buffer_size, transport_opts, protocols]).
+
+-spec validate_opts(map()) -> ok | {error, {unknown_option, term()}}.
+validate_opts(Opts) ->
+    case maps:keys(Opts) -- ?VALID_OPTS of
+        [] -> ok;
+        [Unknown | _] -> {error, {unknown_option, Unknown}}
+    end.
 
 -spec has_alpn_option(proplists:proplist()) -> boolean().
 has_alpn_option(Opts) ->
