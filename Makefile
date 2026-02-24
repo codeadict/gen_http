@@ -16,7 +16,8 @@ clean: ## Clean build artifacts
 format: ## Format code with erlfmt
 	rebar3 fmt -w
 
-test: rebar3 test ## Run all tests (requires test server)
+test: ## Run all tests (requires test server)
+	rebar3 test
 
 dialyzer: ## Run Dialyzer type checker
 	rebar3 dialyzer
