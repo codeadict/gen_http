@@ -33,6 +33,7 @@
     close/1,
     is_open/1,
     get_socket/1,
+    get_window_size/2,
     put_private/3,
     get_private/2,
     get_private/3,
@@ -125,6 +126,10 @@
     data_buffer = <<>> :: binary(),
     %% For CONTINUATION frames
     headers_buffer = <<>> :: binary(),
+    %% Outbound data waiting for flow control window
+    send_buffer = <<>> :: binary(),
+    %% Whether END_STREAM should be sent after send_buffer drains
+    send_end_stream = false :: boolean(),
 
     %% Priority (optional)
     priority :: non_neg_integer() | undefined,
@@ -365,6 +370,25 @@ is_open(#gen_http_h2_conn{state = State}) ->
 get_socket(#gen_http_h2_conn{socket = Socket}) ->
     Socket.
 
+%% @doc Get available send window size.
+%%
+%% Pass `StreamId = 0` for the connection-level window, or a stream ID
+%% for the effective window (min of connection and stream windows).
+%% Callers using `stream_request_body/3` should check this before
+%% sending to avoid exceeding the flow control window.
+-spec get_window_size(conn(), stream_id() | 0) -> {ok, non_neg_integer()} | {error, term()}.
+get_window_size(Conn, 0) ->
+    {ok, Conn#gen_http_h2_conn.send_window};
+get_window_size(Conn, StreamId) ->
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            ConnWindow = Conn#gen_http_h2_conn.send_window,
+            StreamWindow = Stream#stream_state.send_window,
+            {ok, min(ConnWindow, StreamWindow)};
+        error ->
+            {error, {invalid_stream_id, StreamId}}
+    end.
+
 %% @doc Store a private key-value pair in the connection.
 %%
 %% Attach metadata to connections (e.g., pool ID, metrics, tags).
@@ -548,75 +572,152 @@ send_frame(Conn, Frame) ->
     {ok, conn()} | {error, conn(), term()}.
 send_data_frame(Conn, StreamId, eof, _IsLast) ->
     %% Send empty DATA frame with END_STREAM flag
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            case Stream#stream_state.send_buffer of
+                <<>> ->
+                    %% No buffered data, send END_STREAM now
+                    DataFrame = #data{
+                        stream_id = StreamId,
+                        flags = gen_http_parser_h2:set_flags(0, data, [end_stream]),
+                        data = <<>>
+                    },
+                    Conn2 = send_frame(Conn, DataFrame),
+                    NewStream = Stream#stream_state{state = half_closed_local},
+                    {ok, update_stream(Conn2, StreamId, NewStream)};
+                _ ->
+                    %% Data still buffered, mark END_STREAM pending
+                    NewStream = Stream#stream_state{send_end_stream = true},
+                    {ok, update_stream(Conn, StreamId, NewStream)}
+            end;
+        error ->
+            {error, Conn, application_error({invalid_stream_id, StreamId})}
+    end;
+send_data_frame(Conn, StreamId, Data, IsLast) when is_binary(Data) orelse is_list(Data) ->
+    BinData = iolist_to_binary(Data),
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            %% Append new data to anything already buffered
+            AllData = <<(Stream#stream_state.send_buffer)/binary, BinData/binary>>,
+            EndStream = IsLast orelse Stream#stream_state.send_end_stream,
+            send_buffered_data(Conn, StreamId, Stream, AllData, EndStream);
+        error ->
+            {error, Conn, application_error({invalid_stream_id, StreamId})}
+    end.
+
+%% @doc Send as much buffered data as flow control and max frame size allow.
+%% Any remainder is stored in the stream's send_buffer for later flushing
+%% when WINDOW_UPDATE frames arrive.
+-spec send_buffered_data(conn(), stream_id(), stream_state(), binary(), boolean()) ->
+    {ok, conn()}.
+send_buffered_data(Conn, StreamId, Stream, <<>>, true) ->
+    %% All data sent, send END_STREAM
     DataFrame = #data{
         stream_id = StreamId,
         flags = gen_http_parser_h2:set_flags(0, data, [end_stream]),
         data = <<>>
     },
     Conn2 = send_frame(Conn, DataFrame),
-
-    %% Update stream state to half_closed_local
-    case maps:find(StreamId, Conn2#gen_http_h2_conn.streams) of
-        {ok, Stream} ->
-            NewStream = Stream#stream_state{state = half_closed_local},
-            {ok, update_stream(Conn2, StreamId, NewStream)};
-        error ->
-            {error, Conn2, application_error({invalid_stream_id, StreamId})}
-    end;
-send_data_frame(Conn, StreamId, Data, IsLast) when is_binary(Data) orelse is_list(Data) ->
-    BinData = iolist_to_binary(Data),
-
-    %% Check flow control windows
-    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
-        {ok, Stream} ->
-            ConnWindow = Conn#gen_http_h2_conn.send_window,
-            StreamWindow = Stream#stream_state.send_window,
-            MaxSend = min(ConnWindow, min(StreamWindow, byte_size(BinData))),
-
-            case MaxSend of
-                0 ->
-                    %% Flow control blocked
-                    {error, Conn, protocol_error({flow_control_blocked, StreamId})};
+    NewStream = Stream#stream_state{
+        send_buffer = <<>>,
+        send_end_stream = false,
+        state = half_closed_local
+    },
+    {ok, update_stream(Conn2, StreamId, NewStream)};
+send_buffered_data(Conn, StreamId, Stream, <<>>, false) ->
+    %% Nothing to send, nothing buffered
+    NewStream = Stream#stream_state{send_buffer = <<>>, send_end_stream = false},
+    {ok, update_stream(Conn, StreamId, NewStream)};
+send_buffered_data(Conn, StreamId, Stream, Data, EndStream) ->
+    ConnWindow = Conn#gen_http_h2_conn.send_window,
+    StreamWindow = Stream#stream_state.send_window,
+    MaxFrameSize = server_max_frame_size(Conn),
+    Window = min(ConnWindow, StreamWindow),
+    MaxSend = min(Window, byte_size(Data)),
+    case MaxSend of
+        0 ->
+            %% Flow control blocked, buffer the rest
+            NewStream = Stream#stream_state{
+                send_buffer = Data,
+                send_end_stream = EndStream
+            },
+            {ok, update_stream(Conn, StreamId, NewStream)};
+        _ ->
+            %% Send frames up to MaxSend bytes, each at most MaxFrameSize
+            {Conn2, Stream2, Remaining} =
+                send_data_chunks(Conn, StreamId, Stream, Data, MaxSend, MaxFrameSize, EndStream),
+            case Remaining of
+                <<>> when EndStream ->
+                    %% Everything sent and this was the last chunk
+                    NewStream = Stream2#stream_state{
+                        send_buffer = <<>>,
+                        send_end_stream = false,
+                        state = half_closed_local
+                    },
+                    {ok, update_stream(Conn2, StreamId, NewStream)};
                 _ ->
-                    <<ToSend:MaxSend/binary, _Rest/binary>> = BinData,
-
-                    %% Send DATA frame
-                    Flags =
-                        case IsLast andalso MaxSend =:= byte_size(BinData) of
-                            true -> gen_http_parser_h2:set_flags(0, data, [end_stream]);
-                            false -> 0
-                        end,
-
-                    DataFrame = #data{
-                        stream_id = StreamId,
-                        flags = Flags,
-                        data = ToSend
+                    NewStream = Stream2#stream_state{
+                        send_buffer = Remaining,
+                        send_end_stream = EndStream
                     },
-
-                    Conn2 = send_frame(Conn, DataFrame),
-
-                    %% Update windows
-                    NewStream = Stream#stream_state{
-                        send_window = StreamWindow - MaxSend
-                    },
-                    Conn3 = Conn2#gen_http_h2_conn{
-                        send_window = ConnWindow - MaxSend
-                    },
-                    Conn4 = update_stream(Conn3, StreamId, NewStream),
-
-                    %% TODO: Handle remaining data if MaxSend < byte_size(BinData)
-                    {ok, Conn4}
-            end;
-        error ->
-            {error, Conn, application_error({invalid_stream_id, StreamId})}
+                    {ok, update_stream(Conn2, StreamId, NewStream)}
+            end
     end.
+
+%% @doc Send DATA frames in chunks, respecting max frame size and window.
+%% Returns updated conn, stream, and any unsent remainder.
+-spec send_data_chunks(
+    conn(),
+    stream_id(),
+    stream_state(),
+    binary(),
+    non_neg_integer(),
+    pos_integer(),
+    boolean()
+) ->
+    {conn(), stream_state(), binary()}.
+send_data_chunks(Conn, _StreamId, Stream, Data, 0, _MaxFrameSize, _EndStream) ->
+    %% Window exhausted
+    {Conn, Stream, Data};
+send_data_chunks(Conn, _StreamId, Stream, <<>>, _Budget, _MaxFrameSize, _EndStream) ->
+    %% All data sent
+    {Conn, Stream, <<>>};
+send_data_chunks(Conn, StreamId, Stream, Data, Budget, MaxFrameSize, EndStream) ->
+    ChunkSize = min(Budget, min(MaxFrameSize, byte_size(Data))),
+    <<Chunk:ChunkSize/binary, Rest/binary>> = Data,
+
+    %% Set END_STREAM only if this is the last chunk and no data remains
+    Flags =
+        case EndStream andalso Rest =:= <<>> of
+            true -> gen_http_parser_h2:set_flags(0, data, [end_stream]);
+            false -> 0
+        end,
+
+    DataFrame = #data{
+        stream_id = StreamId,
+        flags = Flags,
+        data = Chunk
+    },
+    Conn2 = send_frame(Conn, DataFrame),
+
+    %% Update flow control windows
+    NewStreamWindow = Stream#stream_state.send_window - ChunkSize,
+    NewConnWindow = Conn2#gen_http_h2_conn.send_window - ChunkSize,
+    Stream2 = Stream#stream_state{send_window = NewStreamWindow},
+    Conn3 = Conn2#gen_http_h2_conn{send_window = NewConnWindow},
+
+    NewBudget = Budget - ChunkSize,
+    send_data_chunks(Conn3, StreamId, Stream2, Rest, NewBudget, MaxFrameSize, EndStream).
+
+%% @doc Get the server's max frame size from negotiated settings.
+-spec server_max_frame_size(conn()) -> pos_integer().
+server_max_frame_size(Conn) ->
+    maps:get(max_frame_size, Conn#gen_http_h2_conn.remote_settings, ?MAX_FRAME_SIZE).
 
 -spec send_all_data(conn(), stream_id(), iodata()) ->
     {ok, conn()} | {error, conn(), term()}.
 send_all_data(Conn, StreamId, Data) ->
     BinData = iolist_to_binary(Data),
-    %% TODO: Split into multiple frames if needed
-    %% For now, send in one frame with END_STREAM
     send_data_frame(Conn, StreamId, BinData, true).
 
 %%====================================================================
@@ -893,23 +994,67 @@ handle_data_frame(Conn, StreamId, #data{flags = Flags, data = Data}) ->
     end.
 
 %% @doc Handle WINDOW_UPDATE frame.
+%%
+%% After updating the window, flushes any send-buffered data that was
+%% waiting for flow control capacity.
 -spec handle_window_update_frame(conn(), stream_id(), non_neg_integer()) ->
     {ok, conn(), [h2_response()]} | {error, conn(), term()}.
 handle_window_update_frame(Conn, 0, Increment) ->
-    %% Connection-level window update
-    NewWindow = Conn#gen_http_h2_conn.send_window + Increment,
-    {ok, Conn#gen_http_h2_conn{send_window = NewWindow}, []};
+    %% Connection-level window update -- flush all streams with buffered data
+    NewConn = Conn#gen_http_h2_conn{
+        send_window = Conn#gen_http_h2_conn.send_window + Increment
+    },
+    flush_all_send_buffers(NewConn);
 handle_window_update_frame(Conn, StreamId, Increment) ->
     %% Stream-level window update
     case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
         {ok, Stream} ->
             NewWindow = Stream#stream_state.send_window + Increment,
             NewStream = Stream#stream_state{send_window = NewWindow},
-            {ok, update_stream(Conn, StreamId, NewStream), []};
+            Conn2 = update_stream(Conn, StreamId, NewStream),
+            flush_stream_send_buffer(Conn2, StreamId);
         error ->
             %% Unknown stream, ignore
             {ok, Conn, []}
     end.
+
+%% @doc Flush buffered send data for a single stream.
+-spec flush_stream_send_buffer(conn(), stream_id()) ->
+    {ok, conn(), [h2_response()]}.
+flush_stream_send_buffer(Conn, StreamId) ->
+    case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
+        {ok, Stream} ->
+            case Stream#stream_state.send_buffer of
+                <<>> ->
+                    {ok, Conn, []};
+                Buffered ->
+                    EndStream = Stream#stream_state.send_end_stream,
+                    {ok, Conn2} = send_buffered_data(
+                        Conn, StreamId, Stream, Buffered, EndStream
+                    ),
+                    {ok, Conn2, []}
+            end;
+        error ->
+            {ok, Conn, []}
+    end.
+
+%% @doc Flush send buffers for all streams that have pending data.
+-spec flush_all_send_buffers(conn()) ->
+    {ok, conn(), [h2_response()]}.
+flush_all_send_buffers(Conn) ->
+    StreamIds = [
+        Id
+     || {Id, S} <- maps:to_list(Conn#gen_http_h2_conn.streams),
+        byte_size(S#stream_state.send_buffer) > 0
+    ],
+    flush_streams(Conn, StreamIds).
+
+-spec flush_streams(conn(), [stream_id()]) -> {ok, conn(), [h2_response()]}.
+flush_streams(Conn, []) ->
+    {ok, Conn, []};
+flush_streams(Conn, [StreamId | Rest]) ->
+    {ok, Conn2, _} = flush_stream_send_buffer(Conn, StreamId),
+    flush_streams(Conn2, Rest).
 
 %% @doc Handle GOAWAY frame.
 -spec handle_goaway_frame(conn(), stream_id(), atom(), binary()) ->
@@ -1052,13 +1197,11 @@ transport_error(Other) -> {transport_error, Other}.
 %% Only handles errors that are actually raised in this module
 -spec protocol_error(
     max_concurrent_streams_exceeded
-    | {flow_control_blocked, term()}
     | {frame_parse_error, term()}
     | {hpack_decode_error, term()}
 ) -> gen_http:error_reason().
 protocol_error({frame_parse_error, _} = E) -> {protocol_error, E};
 protocol_error({hpack_decode_error, _} = E) -> {protocol_error, E};
-protocol_error({flow_control_blocked, _} = E) -> {protocol_error, E};
 protocol_error(max_concurrent_streams_exceeded) -> {protocol_error, max_concurrent_streams_exceeded}.
 
 %% @doc Wrap application errors in structured format.

@@ -94,7 +94,6 @@
     | {compression_error, term()}
     | {hpack_decode_error, term()}
     | {flow_control_error, term()}
-    | {flow_control_blocked, term()}
     | {stream_closed, pos_integer()}
     | {invalid_stream_id, pos_integer()}
     | {settings_timeout, term()}
