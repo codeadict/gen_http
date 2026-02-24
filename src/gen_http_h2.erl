@@ -147,6 +147,8 @@
 -define(CONNECTION_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
 -define(DEFAULT_WINDOW_SIZE, 65535).
 -define(MAX_FRAME_SIZE, 16384).
+%% Cap accumulated header block size to prevent CONTINUATION flood (CVE-2024-27316)
+-define(MAX_HEADER_BLOCK_SIZE, 65536).
 
 %% Default settings
 -define(DEFAULT_SETTINGS, #{
@@ -714,6 +716,15 @@ send_data_chunks(Conn, StreamId, Stream, Data, Budget, MaxFrameSize, EndStream) 
 server_max_frame_size(Conn) ->
     maps:get(max_frame_size, Conn#gen_http_h2_conn.remote_settings, ?MAX_FRAME_SIZE).
 
+%% @doc Get the max header block size we accept.
+%% Uses our local SETTINGS_MAX_HEADER_LIST_SIZE if set, otherwise the default cap.
+-spec max_header_block_size(conn()) -> pos_integer().
+max_header_block_size(Conn) ->
+    case maps:get(max_header_list_size, Conn#gen_http_h2_conn.local_settings, undefined) of
+        undefined -> ?MAX_HEADER_BLOCK_SIZE;
+        Size -> Size
+    end.
+
 -spec send_all_data(conn(), stream_id(), iodata()) ->
     {ok, conn()} | {error, conn(), term()}.
 send_all_data(Conn, StreamId, Data) ->
@@ -864,20 +875,21 @@ handle_headers_frame(Conn, StreamId, #h2_headers{flags = Flags, hbf = HeaderBloc
         {ok, Stream} ->
             EndHeaders = gen_http_parser_h2:is_flag_set(Flags, headers, end_headers),
             EndStream = gen_http_parser_h2:is_flag_set(Flags, headers, end_stream),
+            FullHeaderBlock = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>,
 
-            case EndHeaders of
+            case byte_size(FullHeaderBlock) > max_header_block_size(Conn) of
                 true ->
-                    FullHeaderBlock = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>,
-                    decode_and_emit_headers(Conn, StreamId, Stream, FullHeaderBlock, EndStream);
+                    {error, Conn, protocol_error({frame_parse_error, header_block_too_large})};
                 false ->
-                    %% Incomplete headers, wait for CONTINUATION
-                    NewStream = Stream#stream_state{
-                        headers_buffer = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>
-                    },
-                    {ok, update_stream(Conn, StreamId, NewStream), []}
+                    case EndHeaders of
+                        true ->
+                            decode_and_emit_headers(Conn, StreamId, Stream, FullHeaderBlock, EndStream);
+                        false ->
+                            NewStream = Stream#stream_state{headers_buffer = FullHeaderBlock},
+                            {ok, update_stream(Conn, StreamId, NewStream), []}
+                    end
             end;
         error ->
-            %% Unknown stream, ignore
             {ok, Conn, []}
     end.
 
@@ -897,8 +909,15 @@ decode_and_emit_headers(Conn, StreamId, Stream, HeaderBlock, EndStream) ->
             {error, Conn, protocol_error({hpack_decode_error, Reason})}
     end.
 
--spec emit_header_events(conn(), stream_id(), stream_state(), headers(),
-                         status(), gen_http_parser_hpack:context(), boolean()) ->
+-spec emit_header_events(
+    conn(),
+    stream_id(),
+    stream_state(),
+    headers(),
+    status(),
+    gen_http_parser_hpack:context(),
+    boolean()
+) ->
     {ok, conn(), [h2_response()]}.
 emit_header_events(Conn, StreamId, Stream, Headers, Status, NewHpackDecode, EndStream) ->
     RealHeaders = remove_pseudo_headers(Headers),
@@ -1143,14 +1162,17 @@ handle_continuation_frame(Conn, StreamId, #continuation{flags = Flags, hbf = Hea
             EndHeaders = gen_http_parser_h2:is_flag_set(Flags, continuation, end_headers),
             FullHeaderBlock = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>,
 
-            case EndHeaders of
+            case byte_size(FullHeaderBlock) > max_header_block_size(Conn) of
                 true ->
-                    %% CONTINUATION never carries END_STREAM
-                    decode_and_emit_headers(Conn, StreamId, Stream, FullHeaderBlock, false);
+                    {error, Conn, protocol_error({frame_parse_error, header_block_too_large})};
                 false ->
-                    %% Still incomplete, wait for more CONTINUATION
-                    NewStream = Stream#stream_state{headers_buffer = FullHeaderBlock},
-                    {ok, update_stream(Conn, StreamId, NewStream), []}
+                    case EndHeaders of
+                        true ->
+                            decode_and_emit_headers(Conn, StreamId, Stream, FullHeaderBlock, false);
+                        false ->
+                            NewStream = Stream#stream_state{headers_buffer = FullHeaderBlock},
+                            {ok, update_stream(Conn, StreamId, NewStream), []}
+                    end
             end;
         error ->
             {ok, Conn, []}
