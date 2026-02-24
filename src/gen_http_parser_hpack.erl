@@ -2,11 +2,11 @@
 
 %% @doc HPACK: Header Compression for HTTP/2 (RFC 7541).
 %%
-%% This module implements HPACK header compression with static and dynamic tables.
-%% The compression context is pure data (no process state).
+%% HPACK header compression with static and dynamic tables.
+%% Compression context is pure data (no process state).
 %%
-%% Huffman encoding is enabled by default and automatically used when it
-%% reduces the string size (typically ~30% compression for header values).
+%% Huffman encoding is used when it reduces string size
+%% (typically ~30% compression for header values).
 
 -export([
     new/0,

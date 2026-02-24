@@ -8,7 +8,7 @@ CT_LOG_DIR="${1:-_build/test/logs}"
 OUTPUT_FILE="${GITHUB_STEP_SUMMARY:-/tmp/summary.md}"
 
 # Find the latest test run
-LATEST_RUN=$(find "$CT_LOG_DIR" -name "suite.log.html" -path "*/h2_compliance_SUITE.logs/*" -type f 2>/dev/null | sort -r | head -1)
+LATEST_RUN=$(find "$CT_LOG_DIR" -name "suite.log.html" -path "*h2_compliance_SUITE.logs/*" -type f 2>/dev/null | sort -r | head -1)
 
 if [ -z "$LATEST_RUN" ]; then
     echo "⚠️  No test results found in $CT_LOG_DIR"
@@ -22,24 +22,30 @@ echo "📊 Parsing test results from: $LATEST_RUN"
 declare -A TEST_STATUS
 
 # Parse the HTML log for test results
-# Look for patterns like: h2_compliance_SUITE:run_connection_preface ok
-# or: h2_compliance_SUITE:run_connection_preface FAILED
+# Look for patterns in HTML table rows like:
+# <td>...run_connection_preface...</td>...<td><font color="red">FAILED</font></td>
+# or <td>...run_connection_preface...</td>...<td><font color="green">Ok</font></td>
 
 # Method 1: Try to parse from suite log
 while IFS= read -r line; do
-    if [[ "$line" =~ h2_compliance_SUITE:run_([a-z_]+).*\<font\ color=\"green\"\>ok\<\/font\> ]] || \
-       [[ "$line" =~ h2_compliance_SUITE\.run_([a-z_]+):.*ok ]]; then
+    if [[ "$line" =~ h2_compliance_suite\.run_([a-z_]+) ]]; then
         group="${BASH_REMATCH[1]}"
-        TEST_STATUS["$group"]="✅"
-    elif [[ "$line" =~ h2_compliance_SUITE:run_([a-z_]+).*FAILED ]] || \
-         [[ "$line" =~ h2_compliance_SUITE\.run_([a-z_]+):.*FAILED ]]; then
-        group="${BASH_REMATCH[1]}"
-        TEST_STATUS["$group"]="❌"
+        # Check if this line has FAILED or Ok/ok in it
+        if [[ "$line" =~ \<font\ color=\"red\"\>FAILED\<\/font\> ]]; then
+            TEST_STATUS["$group"]="❌"
+        elif [[ "$line" =~ \<font\ color=\"[^\"]+\"\>(Ok|ok)\<\/font\> ]]; then
+            TEST_STATUS["$group"]="✅"
+        fi
     fi
-done < "$LATEST_RUN"
+done <"$LATEST_RUN"
 
 # Method 2: If we didn't find results, check if "All tests passed"
-if [ ${#TEST_STATUS[@]} -eq 0 ]; then
+# Temporarily disable unbound variable check for array length check
+set +u
+array_size=${#TEST_STATUS[@]}
+set -u
+
+if [ $array_size -eq 0 ]; then
     if grep -q "All.*tests passed" "$LATEST_RUN" 2>/dev/null; then
         echo "✓ All tests passed (detected from summary)"
         ALL_PASSED=true
@@ -48,7 +54,7 @@ if [ ${#TEST_STATUS[@]} -eq 0 ]; then
         ALL_PASSED=false
     fi
 else
-    echo "✓ Parsed ${#TEST_STATUS[@]} test group results"
+    echo "✓ Parsed $array_size test group results"
     ALL_PASSED=true
     for status in "${TEST_STATUS[@]}"; do
         if [ "$status" = "❌" ]; then
@@ -61,7 +67,10 @@ fi
 # Helper function to get status for a group
 get_status() {
     local group="$1"
-    if [ ${#TEST_STATUS[@]} -eq 0 ]; then
+    set +u
+    local array_size=${#TEST_STATUS[@]}
+    set -u
+    if [ $array_size -eq 0 ]; then
         # No parsed results, use ALL_PASSED flag
         if [ "$ALL_PASSED" = true ]; then
             echo "✅"
@@ -92,9 +101,9 @@ for group in connection_preface frame_format frame_size header_compression \
 
     status=$(get_status "$group")
     if [ "$status" = "✅" ]; then
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
     else
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
 done
 
@@ -103,7 +112,7 @@ SUCCESS_RATE=$((PASSED * 100 / TOTAL_GROUPS))
 echo "📈 Results: $PASSED passed, $FAILED failed ($SUCCESS_RATE% success rate)"
 
 # Generate summary header
-cat > "$OUTPUT_FILE" << EOF
+cat >"$OUTPUT_FILE" <<EOF
 # 🧪 HTTP/2 Compliance Test Results
 
 ## Summary
@@ -111,7 +120,7 @@ cat > "$OUTPUT_FILE" << EOF
 EOF
 
 if [ "$FAILED" -eq 0 ]; then
-    cat >> "$OUTPUT_FILE" << EOF
+    cat >>"$OUTPUT_FILE" <<EOF
 ### ✅ All Tests Passed!
 
 - **Total Groups**: 37
@@ -121,7 +130,7 @@ if [ "$FAILED" -eq 0 ]; then
 
 EOF
 else
-    cat >> "$OUTPUT_FILE" << EOF
+    cat >>"$OUTPUT_FILE" <<EOF
 ### ⚠️ Some Tests Failed
 
 - **Passed**: $PASSED / $TOTAL_GROUPS groups
@@ -132,7 +141,7 @@ EOF
 fi
 
 # Generate detailed tables with actual status
-cat >> "$OUTPUT_FILE" << EOF
+cat >>"$OUTPUT_FILE" <<EOF
 ## Test Coverage by RFC Section
 
 ### RFC 7540 - HTTP/2 Protocol
@@ -283,14 +292,6 @@ cat >> "$OUTPUT_FILE" << EOF
 - **Failed**: $FAILED
 - **Success Rate**: ${SUCCESS_RATE}%
 - **Total Individual Tests**: 156
-- **RFC 7540 Coverage**: $([ "$FAILED" -eq 0 ] && echo "Complete" || echo "Partial")
-- **RFC 7541 Coverage**: $([ "$FAILED" -eq 0 ] && echo "Complete" || echo "Partial")
-
-## 📝 Documentation
-
-- [Full Coverage Guide](docs/H2_COMPLIANCE_FULL_COVERAGE.md)
-- [Test Results](docs/H2_COMPLIANCE_TEST_RESULTS.md)
-- [Setup Instructions](docs/H2_COMPLIANCE_SETUP.md)
 
 EOF
 

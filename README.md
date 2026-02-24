@@ -11,24 +11,15 @@ HTTP/1.1 and HTTP/2 support. Pure Erlang. Zero dependencies.
 
 ## Why?
 
-- **Fast**: Optimized for performance with inline compilation and buffer tuning
-- **Simple**: Small API surface, easy to understand
-- **Correct**: Proper HTTP/1.1 and HTTP/2 protocol handling
-- **Flexible**: Works with both protocols transparently
+Fast. Small API. Proper HTTP/1.1 and HTTP/2 support. Works with both protocols transparently.
 
 Built to replace `httpc` with better performance and cleaner code.
 
 ## HTTP/2 Compliance
 
-**156 compliance tests** covering RFC 7540 (HTTP/2) and RFC 7541 (HPACK)
+**156 tests** covering RFC 7540 (HTTP/2) and RFC 7541 (HPACK). All frame types, stream states, flow control, priority handling, HPACK compression, and error conditions.
 
-- Complete frame type validation (DATA, HEADERS, SETTINGS, PING, etc.)
-- Stream state machine verification
-- Flow control and priority handling
-- HPACK compression/decompression
-- All error conditions tested
-
-Tested against [h2-client-test-harness](https://github.com/nomadlabsinc/h2-client-test-harness) with **100% pass rate**.
+Tested against [h2-client-test-harness](https://github.com/nomadlabsinc/h2-client-test-harness). **100% pass rate**.
 
 ## Quick Start
 
