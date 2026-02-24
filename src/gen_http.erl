@@ -48,7 +48,7 @@
     error_reason/0
 ]).
 
--type conn() :: gen_http_h1:conn() | gen_http_h2:conn().
+-opaque conn() :: gen_http_h1:conn() | gen_http_h2:conn().
 
 %%====================================================================
 %% Structured Error Types
