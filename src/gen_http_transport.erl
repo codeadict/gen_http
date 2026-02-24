@@ -37,6 +37,15 @@
 -callback recv(Socket :: socket(), Length :: non_neg_integer(), Timeout :: timeout()) ->
     {ok, binary() | list()} | {error, Reason :: term()}.
 
+-callback peername(Socket :: socket()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, Reason :: term()}.
+
+-callback sockname(Socket :: socket()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, Reason :: term()}.
+
+-callback getstat(Socket :: socket()) ->
+    {ok, [{atom(), integer()}]} | {error, Reason :: term()}.
+
 %%====================================================================
 %% Utility Functions
 %%====================================================================

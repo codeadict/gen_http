@@ -11,7 +11,10 @@
     close/1,
     setopts/2,
     controlling_process/2,
-    recv/3
+    recv/3,
+    peername/1,
+    sockname/1,
+    getstat/1
 ]).
 
 -export_type([address/0, scheme/0, socket/0]).
@@ -113,3 +116,18 @@ controlling_process(Socket, Pid) ->
     {ok, binary() | list()} | {error, term()}.
 recv(Socket, Length, Timeout) ->
     gen_tcp:recv(Socket, Length, Timeout).
+
+%% @doc Get the remote address and port.
+-spec peername(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+peername(Socket) ->
+    inet:peername(Socket).
+
+%% @doc Get the local address and port.
+-spec sockname(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+sockname(Socket) ->
+    inet:sockname(Socket).
+
+%% @doc Get socket statistics (bytes sent/received, etc.).
+-spec getstat(socket()) -> {ok, [{atom(), integer()}]} | {error, term()}.
+getstat(Socket) ->
+    inet:getstat(Socket).
