@@ -38,7 +38,7 @@ connect(Address, Port, Opts) ->
             Bin when is_binary(Bin) -> binary_to_list(Bin);
             _ -> Address
         end,
-    AlpnProtocols = proplists:get_value(alpn_advertise, Opts, [<<"h2">>, <<"http/1.1">>]),
+    AlpnProtocols = get_alpn_protocols(Opts, [<<"h2">>, <<"http/1.1">>]),
     Timeout = proplists:get_value(timeout, Opts, 5000),
 
     %% Default buffer sizes optimized for HTTPS traffic (64KB - high throughput)
@@ -94,7 +94,7 @@ connect(Address, Port, Opts) ->
 -spec upgrade(socket(), scheme(), binary(), inet:port_number(), proplists:proplist()) ->
     {ok, socket()} | {error, term()}.
 upgrade(Socket, _OriginalScheme, Hostname, _Port, Opts) ->
-    AlpnProtocols = proplists:get_value(alpn_advertise, Opts, [<<"h2">>, <<"http/1.1">>]),
+    AlpnProtocols = get_alpn_protocols(Opts, [<<"h2">>, <<"http/1.1">>]),
     Timeout = proplists:get_value(timeout, Opts, 5000),
 
     SSLOpts = [
@@ -157,6 +157,20 @@ recv(Socket, Length, Timeout) ->
 %%====================================================================
 %% Internal functions
 %%====================================================================
+
+%% @doc Resolve ALPN protocols from options.
+%%
+%% Checks `alpn_advertise` (library convention) first, then falls back
+%% to `alpn_advertised_protocols` (OTP ssl convention) for users who
+%% pass raw ssl options.
+-spec get_alpn_protocols(proplists:proplist(), [binary()]) -> [binary()].
+get_alpn_protocols(Opts, Default) ->
+    case proplists:get_value(alpn_advertise, Opts) of
+        undefined ->
+            proplists:get_value(alpn_advertised_protocols, Opts, Default);
+        Protocols ->
+            Protocols
+    end.
 
 %% @doc Get CA certificate options for SSL verification.
 %% Uses OTP 25+ cacerts_get/0 if available, falls back to user-provided certs.

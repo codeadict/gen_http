@@ -132,10 +132,9 @@ connect(Scheme, Address, Port, Opts) ->
         case Scheme of
             https ->
                 AlpnOpts =
-                    case proplists:get_value(alpn_advertise, TransportOpts) of
-                        undefined -> [{alpn_advertise, [<<"http/1.1">>]}];
-                        %% User explicitly set ALPN, respect it
-                        _ -> []
+                    case has_alpn_option(TransportOpts) of
+                        true -> [];
+                        false -> [{alpn_advertise, [<<"http/1.1">>]}]
                     end,
                 [{timeout, Timeout} | AlpnOpts ++ TransportOpts];
             _ ->
@@ -337,6 +336,11 @@ delete_private(#gen_http_h1_conn{private = Private} = Conn, Key) ->
 %%====================================================================
 %% Internal Functions - Connection Setup
 %%====================================================================
+
+-spec has_alpn_option(proplists:proplist()) -> boolean().
+has_alpn_option(Opts) ->
+    proplists:is_defined(alpn_advertise, Opts) orelse
+        proplists:is_defined(alpn_advertised_protocols, Opts).
 
 -spec setup_socket_mode(module(), socket(), active | passive) -> ok | {error, gen_http:error_reason()}.
 setup_socket_mode(Transport, Socket, active) ->
