@@ -867,45 +867,8 @@ handle_headers_frame(Conn, StreamId, #h2_headers{flags = Flags, hbf = HeaderBloc
 
             case EndHeaders of
                 true ->
-                    %% Complete header block, decode with HPACK
                     FullHeaderBlock = <<(Stream#stream_state.headers_buffer)/binary, HeaderBlock/binary>>,
-                    case gen_http_parser_hpack:decode(FullHeaderBlock, Conn#gen_http_h2_conn.hpack_decode) of
-                        {ok, Headers, NewHpackDecode} ->
-                            case extract_status(Headers) of
-                                {ok, Status} ->
-                                    RealHeaders = remove_pseudo_headers(Headers),
-
-                                    NewStreamState =
-                                        case EndStream of
-                                            true -> half_closed_remote;
-                                            false -> Stream#stream_state.state
-                                        end,
-
-                                    NewStream = Stream#stream_state{
-                                        status = Status,
-                                        response_headers = RealHeaders,
-                                        headers_buffer = <<>>,
-                                        state = NewStreamState
-                                    },
-
-                                    Conn2 = update_stream(Conn, StreamId, NewStream),
-                                    Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
-
-                                    StatusEvent = {headers, Stream#stream_state.ref, StreamId, RealHeaders},
-                                    DoneEvent =
-                                        case EndStream of
-                                            true -> [{done, Stream#stream_state.ref, StreamId}];
-                                            false -> []
-                                        end,
-
-                                    Events = [StatusEvent | DoneEvent],
-                                    {ok, Conn3, Events};
-                                {error, missing_status} ->
-                                    {error, Conn, protocol_error({frame_parse_error, missing_status_pseudo_header})}
-                            end;
-                        {error, Reason} ->
-                            {error, Conn, protocol_error({hpack_decode_error, Reason})}
-                    end;
+                    decode_and_emit_headers(Conn, StreamId, Stream, FullHeaderBlock, EndStream);
                 false ->
                     %% Incomplete headers, wait for CONTINUATION
                     NewStream = Stream#stream_state{
@@ -917,6 +880,48 @@ handle_headers_frame(Conn, StreamId, #h2_headers{flags = Flags, hbf = HeaderBloc
             %% Unknown stream, ignore
             {ok, Conn, []}
     end.
+
+%% @doc Decode complete header block and emit response events.
+-spec decode_and_emit_headers(conn(), stream_id(), stream_state(), binary(), boolean()) ->
+    {ok, conn(), [h2_response()]} | {error, conn(), term()}.
+decode_and_emit_headers(Conn, StreamId, Stream, HeaderBlock, EndStream) ->
+    case gen_http_parser_hpack:decode(HeaderBlock, Conn#gen_http_h2_conn.hpack_decode) of
+        {ok, Headers, NewHpackDecode} ->
+            case extract_status(Headers) of
+                {ok, Status} ->
+                    emit_header_events(Conn, StreamId, Stream, Headers, Status, NewHpackDecode, EndStream);
+                {error, missing_status} ->
+                    {error, Conn, protocol_error({frame_parse_error, missing_status_pseudo_header})}
+            end;
+        {error, Reason} ->
+            {error, Conn, protocol_error({hpack_decode_error, Reason})}
+    end.
+
+-spec emit_header_events(conn(), stream_id(), stream_state(), headers(),
+                         status(), gen_http_parser_hpack:context(), boolean()) ->
+    {ok, conn(), [h2_response()]}.
+emit_header_events(Conn, StreamId, Stream, Headers, Status, NewHpackDecode, EndStream) ->
+    RealHeaders = remove_pseudo_headers(Headers),
+    NewStreamState =
+        case EndStream of
+            true -> half_closed_remote;
+            false -> Stream#stream_state.state
+        end,
+    NewStream = Stream#stream_state{
+        status = Status,
+        response_headers = RealHeaders,
+        headers_buffer = <<>>,
+        state = NewStreamState
+    },
+    Conn2 = update_stream(Conn, StreamId, NewStream),
+    Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
+    HeaderEvent = {headers, Stream#stream_state.ref, StreamId, RealHeaders},
+    DoneEvent =
+        case EndStream of
+            true -> [{done, Stream#stream_state.ref, StreamId}];
+            false -> []
+        end,
+    {ok, Conn3, [HeaderEvent | DoneEvent]}.
 
 %% @doc Handle DATA frame (response body).
 -spec handle_data_frame(conn(), stream_id(), #data{}) ->
@@ -1140,30 +1145,8 @@ handle_continuation_frame(Conn, StreamId, #continuation{flags = Flags, hbf = Hea
 
             case EndHeaders of
                 true ->
-                    %% Complete header block, decode with HPACK
-                    case gen_http_parser_hpack:decode(FullHeaderBlock, Conn#gen_http_h2_conn.hpack_decode) of
-                        {ok, Headers, NewHpackDecode} ->
-                            case extract_status(Headers) of
-                                {ok, Status} ->
-                                    RealHeaders = remove_pseudo_headers(Headers),
-
-                                    NewStream = Stream#stream_state{
-                                        status = Status,
-                                        response_headers = RealHeaders,
-                                        headers_buffer = <<>>
-                                    },
-
-                                    Conn2 = update_stream(Conn, StreamId, NewStream),
-                                    Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
-
-                                    Response = {headers, Stream#stream_state.ref, StreamId, RealHeaders},
-                                    {ok, Conn3, [Response]};
-                                {error, missing_status} ->
-                                    {error, Conn, protocol_error({frame_parse_error, missing_status_pseudo_header})}
-                            end;
-                        {error, Reason} ->
-                            {error, Conn, protocol_error({hpack_decode_error, Reason})}
-                    end;
+                    %% CONTINUATION never carries END_STREAM
+                    decode_and_emit_headers(Conn, StreamId, Stream, FullHeaderBlock, false);
                 false ->
                     %% Still incomplete, wait for more CONTINUATION
                     NewStream = Stream#stream_state{headers_buffer = FullHeaderBlock},
