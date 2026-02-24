@@ -178,6 +178,100 @@ prop_window_update_frame() ->
     end).
 
 %% -------------------------------------------------------------------
+%% HEADERS Packet (the missing frame type from the original suite)
+%% -------------------------------------------------------------------
+
+prop_headers_frame_no_padding_no_priority() ->
+    ?FORALL(
+        {StreamId, Hbf},
+        {non_zero_stream_id(), binary()},
+        begin
+            ?assertRoundTrip(#h2_headers{
+                stream_id = StreamId,
+                flags = 16#00,
+                hbf = Hbf,
+                is_exclusive = undefined,
+                stream_dependency = undefined,
+                weight = undefined,
+                padding = undefined
+            }),
+            true
+        end
+    ).
+
+prop_headers_frame_with_priority() ->
+    ?FORALL(
+        {StreamId, Hbf, StreamDep, Exclusive, Weight},
+        {non_zero_stream_id(), binary(), non_zero_stream_id(), boolean(), integer(1, 256)},
+        begin
+            ?assertRoundTrip(#h2_headers{
+                stream_id = StreamId,
+                flags = 16#20,
+                hbf = Hbf,
+                is_exclusive = Exclusive,
+                stream_dependency = StreamDep,
+                weight = Weight,
+                padding = undefined
+            }),
+            true
+        end
+    ).
+
+prop_headers_frame_with_padding() ->
+    ?FORALL(
+        {StreamId, Hbf, Padding},
+        {non_zero_stream_id(), binary(), binary()},
+        begin
+            ?assertRoundTrip(#h2_headers{
+                stream_id = StreamId,
+                flags = 16#08,
+                hbf = Hbf,
+                is_exclusive = undefined,
+                stream_dependency = undefined,
+                weight = undefined,
+                padding = Padding
+            }),
+            true
+        end
+    ).
+
+prop_headers_frame_with_priority_and_padding() ->
+    ?FORALL(
+        {StreamId, Hbf, StreamDep, Exclusive, Weight, Padding},
+        {non_zero_stream_id(), binary(), non_zero_stream_id(), boolean(), integer(1, 256), binary()},
+        begin
+            ?assertRoundTrip(#h2_headers{
+                stream_id = StreamId,
+                flags = 16#28,
+                hbf = Hbf,
+                is_exclusive = Exclusive,
+                stream_dependency = StreamDep,
+                weight = Weight,
+                padding = Padding
+            }),
+            true
+        end
+    ).
+
+prop_headers_frame_end_stream() ->
+    ?FORALL(
+        {StreamId, Hbf},
+        {non_zero_stream_id(), binary()},
+        begin
+            ?assertRoundTrip(#h2_headers{
+                stream_id = StreamId,
+                flags = 16#01,
+                hbf = Hbf,
+                is_exclusive = undefined,
+                stream_dependency = undefined,
+                weight = undefined,
+                padding = undefined
+            }),
+            true
+        end
+    ).
+
+%% -------------------------------------------------------------------
 %% CONTINUATION Packet
 %% -------------------------------------------------------------------
 
