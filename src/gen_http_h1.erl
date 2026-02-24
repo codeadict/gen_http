@@ -71,6 +71,7 @@
 
     %% Settings
     max_pipeline = 10 :: pos_integer(),
+    max_buffer_size = 1048576 :: pos_integer(),
     log = false :: boolean(),
 
     %% User metadata storage
@@ -122,6 +123,7 @@ connect(Scheme, Address, Port, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     Mode = maps:get(mode, Opts, active),
     MaxPipeline = maps:get(max_pipeline, Opts, 10),
+    MaxBufferSize = maps:get(max_buffer_size, Opts, 1048576),
 
     TransportOpts = maps:get(transport_opts, Opts, []),
 
@@ -143,7 +145,7 @@ connect(Scheme, Address, Port, Opts) ->
     maybe
         {ok, Socket} ?= Transport:connect(Address, Port, ConnectOpts),
         ok ?= setup_socket_mode(Transport, Socket, Mode),
-        Conn = make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline),
+        Conn = make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline, MaxBufferSize),
         {ok, Conn}
     else
         {error, Reason} -> {error, transport_error({connect_failed, Reason})}
@@ -355,9 +357,10 @@ setup_socket_mode(_Transport, _Socket, passive) ->
     address(),
     inet:port_number(),
     active | passive,
+    pos_integer(),
     pos_integer()
 ) -> conn().
-make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline) ->
+make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline, MaxBufferSize) ->
     #gen_http_h1_conn{
         transport = Transport,
         socket = Socket,
@@ -366,7 +369,8 @@ make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline) ->
         scheme = Scheme,
         state = open,
         mode = Mode,
-        max_pipeline = MaxPipeline
+        max_pipeline = MaxPipeline,
+        max_buffer_size = MaxBufferSize
     }.
 
 -spec check_can_send_request(conn()) -> ok | {error, gen_http:error_reason()}.
@@ -548,15 +552,25 @@ normalize_host(Host) when is_atom(Host) -> atom_to_binary(Host, utf8).
 -spec handle_data(conn(), binary()) ->
     {ok, conn(), [response()]} | {error, conn(), term(), [response()]}.
 handle_data(Conn, Data) ->
-    #gen_http_h1_conn{buffer = Buffer, mode = Mode, transport = Transport, socket = Socket} = Conn,
+    #gen_http_h1_conn{
+        buffer = Buffer,
+        mode = Mode,
+        transport = Transport,
+        socket = Socket,
+        max_buffer_size = MaxBuf
+    } = Conn,
     NewBuffer = maybe_concat(Buffer, Data),
-
-    case parse_responses(Conn#gen_http_h1_conn{buffer = NewBuffer}, []) of
-        {ok, NewConn, Responses} ->
-            reactivate_socket_if_needed(Transport, Socket, Mode, NewConn),
-            {ok, NewConn, Responses};
-        {error, NewConn, Reason, Responses} ->
-            {error, NewConn, Reason, Responses}
+    case byte_size(NewBuffer) > MaxBuf of
+        true ->
+            {error, Conn, {application_error, buffer_overflow}, []};
+        false ->
+            case parse_responses(Conn#gen_http_h1_conn{buffer = NewBuffer}, []) of
+                {ok, NewConn, Responses} ->
+                    reactivate_socket_if_needed(Transport, Socket, Mode, NewConn),
+                    {ok, NewConn, Responses};
+                {error, NewConn, Reason, Responses} ->
+                    {error, NewConn, Reason, Responses}
+            end
     end.
 
 -spec reactivate_socket_if_needed(module(), socket(), active | passive, conn()) -> ok.
