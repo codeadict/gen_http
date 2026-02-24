@@ -3,13 +3,13 @@
 
 %% @doc HTTP/1.1 connection state machine.
 %%
-%% This module implements a process-less HTTP/1.1 client with support for:
+%% Process-less HTTP/1.1 client. Supports:
 %% - Request pipelining
 %% - Keep-alive connections
 %% - Chunked transfer encoding
 %% - Body streaming (request and response)
 %%
-%% The connection state is a pure data structure passed between function calls.
+%% Connection state is a pure data structure passed between function calls.
 
 %% Compiler optimizations for hot-path functions
 -compile(inline).
@@ -310,7 +310,7 @@ get_socket(#gen_http_h1_conn{socket = Socket}) ->
 
 %% @doc Store a private key-value pair in the connection.
 %%
-%% This allows users to attach metadata to connections (e.g., pool ID, metrics, tags).
+%% Attach metadata to connections (e.g., pool ID, metrics, tags).
 -spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
 put_private(#gen_http_h1_conn{private = Private} = Conn, Key, Value) ->
     Conn#gen_http_h1_conn{private = maps:put(Key, Value, Private)}.

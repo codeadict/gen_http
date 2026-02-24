@@ -10,6 +10,6 @@
     | {headers, request_ref(), headers()}
     | {data, request_ref(), binary()}
     | {done, request_ref()}.
--type socket() :: term().
+-type socket() :: gen_tcp:socket() | ssl:sslsocket().
 
 -define(DEFAULT_PROTOCOLS, [http1, http2]).

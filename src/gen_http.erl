@@ -2,8 +2,7 @@
 
 %% @doc Unified interface for HTTP/1.1 and HTTP/2 connections.
 %%
-%% This module provides protocol-agnostic functions that work with both
-%% gen_http_h1 and gen_http_h2 connections.
+%% Protocol-agnostic functions that work with both gen_http_h1 and gen_http_h2.
 
 %% Compiler optimizations for hot-path functions
 -compile(inline).
@@ -370,7 +369,7 @@ get_socket(Conn) when is_tuple(Conn) ->
 
 %% @doc Store a private key-value pair in the connection.
 %%
-%% This allows users to attach metadata to connections (e.g., pool ID, metrics, tags).
+%% Attach metadata to connections (e.g., pool ID, metrics, tags).
 %% Works with both HTTP/1.1 and HTTP/2 connections.
 %%
 %% ## Examples

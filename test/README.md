@@ -4,12 +4,7 @@ This directory contains tests for the gen_http HTTP client library.
 
 ## Test Infrastructure
 
-Tests use a local Docker-based infrastructure instead of making requests to external websites. This provides:
-
-- **Reliability**: Tests don't fail due to network issues
-- **Speed**: Local requests are much faster
-- **Control**: We control the test server behavior
-- **Privacy**: No external requests during development
+Tests run against local Docker containers instead of hitting external websites. This means tests won't randomly fail from network issues, they run faster, and you're not leaking requests during development.
 
 ### Test Server Setup
 
@@ -65,7 +60,7 @@ docker compose -f test/support/docker-compose.yml down -v
 
 ## Test Server Endpoints
 
-The local httpbin service provides the following endpoints:
+httpbin gives you these endpoints:
 
 - `GET /get` - Returns GET request data
 - `POST /post` - Returns POST request data
@@ -73,11 +68,11 @@ The local httpbin service provides the following endpoints:
 - `GET /delay/{seconds}` - Delays response
 - `GET /redirect/{n}` - 302 redirect n times
 - `POST /anything` - Returns anything sent
-- And many more (see [httpbin.org](https://httpbin.org/) for full API)
+- Plus more at [httpbin.org](https://httpbin.org/)
 
 ## Configuration
 
-Test server ports can be configured via environment variables:
+Change ports with environment variables:
 
 - `HTTPBIN_HTTP_PORT` (default: 8080) - HTTP server port
 - `HTTPBIN_HTTPS_PORT` (default: 8443) - HTTPS server port
@@ -101,15 +96,11 @@ If tests are being skipped with "Test server not available", ensure:
 
 ### Port conflicts
 
-If ports 8080 or 8443 are already in use:
-
-1. Stop conflicting services
-2. Or change ports in `.env` file
-3. Restart Docker Compose
+If ports 8080 or 8443 are already in use, either stop whatever's using them or change the ports in `.env` and restart docker compose.
 
 ### SSL certificate errors
 
-The Caddy server uses self-signed certificates for local testing. Tests should use the `verify_none` SSL option:
+Caddy uses self-signed certificates for local testing. Use `verify_none` in your tests:
 
 ```erlang
 {ok, Conn} = gen_http:connect(https, "localhost", 8443, #{

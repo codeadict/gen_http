@@ -3,7 +3,7 @@
 
 %% @doc HTTP/2 connection state machine.
 %%
-%% This module implements a process-less HTTP/2 client with support for:
+%% Process-less HTTP/2 client. Supports:
 %% - Stream multiplexing (multiple concurrent requests)
 %% - Flow control (connection and stream level)
 %% - Settings negotiation
@@ -11,7 +11,7 @@
 %% - Server push
 %% - GOAWAY handling
 %%
-%% The connection state is a pure data structure passed between function calls.
+%% Connection state is a pure data structure passed between function calls.
 
 %% Compiler optimizations for hot-path functions
 -compile(inline).
@@ -367,7 +367,7 @@ get_socket(#gen_http_h2_conn{socket = Socket}) ->
 
 %% @doc Store a private key-value pair in the connection.
 %%
-%% This allows users to attach metadata to connections (e.g., pool ID, metrics, tags).
+%% Attach metadata to connections (e.g., pool ID, metrics, tags).
 -spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
 put_private(#gen_http_h2_conn{private = Private} = Conn, Key, Value) ->
     Conn#gen_http_h2_conn{private = maps:put(Key, Value, Private)}.
