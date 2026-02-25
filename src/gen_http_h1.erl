@@ -18,6 +18,7 @@
         get_socket/1,
         maybe_concat/2,
         has_alpn_option/1,
+        fast_body_path/2,
         transport_error/1,
         protocol_error/1,
         application_error/1
@@ -75,6 +76,10 @@
 
     %% Request/Response tracking
     buffer = <<>> :: binary(),
+    %% Active request being parsed — stored directly to avoid queue
+    %% operations on the hot path (every recv during body reading).
+    current_request = undefined :: request_state() | undefined,
+    %% Pipelined requests waiting to be processed.
     requests = queue:new() :: queue:queue(request_state()),
     streaming_request = undefined :: request_ref() | undefined,
 
@@ -408,8 +413,15 @@ make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline, Max
 -spec check_can_send_request(conn()) -> ok | {error, gen_http:error_reason()}.
 check_can_send_request(#gen_http_h1_conn{state = closed}) ->
     {error, application_error(connection_closed)};
-check_can_send_request(#gen_http_h1_conn{requests = Requests, max_pipeline = MaxPipeline}) ->
-    case queue:len(Requests) >= MaxPipeline of
+check_can_send_request(#gen_http_h1_conn{
+    current_request = Current, requests = Requests, max_pipeline = MaxPipeline
+}) ->
+    ActiveCount =
+        case Current of
+            undefined -> 0;
+            _ -> 1
+        end,
+    case queue:len(Requests) + ActiveCount >= MaxPipeline of
         true -> {error, application_error(pipeline_full)};
         false -> ok
     end.
@@ -475,8 +487,13 @@ send_request_normal(Conn, Method, Path, Headers, Body) ->
 -spec queue_request_state(conn(), request_ref(), binary()) -> conn().
 queue_request_state(Conn, RequestRef, Method) ->
     ReqState = #request_state{ref = RequestRef, method = Method},
-    NewRequests = queue:in(ReqState, Conn#gen_http_h1_conn.requests),
-    Conn#gen_http_h1_conn{requests = NewRequests}.
+    case Conn#gen_http_h1_conn.current_request of
+        undefined ->
+            Conn#gen_http_h1_conn{current_request = ReqState};
+        _ ->
+            NewRequests = queue:in(ReqState, Conn#gen_http_h1_conn.requests),
+            Conn#gen_http_h1_conn{requests = NewRequests}
+    end.
 
 -spec handle_send_error(conn(), term()) -> {error, conn(), gen_http:error_reason()}.
 handle_send_error(Conn, Reason) ->
@@ -531,37 +548,53 @@ send_chunk(Conn, _RequestRef, Chunk) ->
 -spec add_default_headers(headers(), binary(), inet:port_number(), iodata() | stream) ->
     headers().
 add_default_headers(Headers, Host, Port, Body) ->
-    H1 = add_host_header(Headers, Host, Port),
-    H2 = add_content_length_header(H1, Body),
-    add_connection_header(H2).
-
--spec add_host_header(headers(), binary(), inet:port_number()) -> headers().
-add_host_header(Headers, Host, Port) ->
-    case lists:keyfind(<<"host">>, 1, Headers) of
-        false -> [{<<"host">>, format_host(Host, Port)} | Headers];
-        _ -> Headers
+    {HasHost, HasCL, HasConn, HasUA} = scan_default_headers(Headers),
+    H1 =
+        case HasHost of
+            false -> [{<<"host">>, format_host(Host, Port)} | Headers];
+            true -> Headers
+        end,
+    H2 = maybe_add_content_length(H1, Body, HasCL),
+    H3 =
+        case HasConn of
+            false -> [{<<"connection">>, <<"keep-alive">>} | H2];
+            true -> H2
+        end,
+    case HasUA of
+        false -> [{<<"user-agent">>, <<"gen_http/0.1">>} | H3];
+        true -> H3
     end.
 
--spec add_content_length_header(headers(), iodata() | stream) -> headers().
-add_content_length_header(Headers, stream) ->
+-spec scan_default_headers(headers()) ->
+    {boolean(), boolean(), boolean(), boolean()}.
+scan_default_headers(Headers) ->
+    scan_default_headers(Headers, false, false, false, false).
+
+-spec scan_default_headers(headers(), boolean(), boolean(), boolean(), boolean()) ->
+    {boolean(), boolean(), boolean(), boolean()}.
+scan_default_headers([], H, C, K, U) ->
+    {H, C, K, U};
+scan_default_headers([{<<"host">>, _} | Rest], _, C, K, U) ->
+    scan_default_headers(Rest, true, C, K, U);
+scan_default_headers([{<<"content-length">>, _} | Rest], H, _, K, U) ->
+    scan_default_headers(Rest, H, true, K, U);
+scan_default_headers([{<<"connection">>, _} | Rest], H, C, _, U) ->
+    scan_default_headers(Rest, H, C, true, U);
+scan_default_headers([{<<"user-agent">>, _} | Rest], H, C, K, _) ->
+    scan_default_headers(Rest, H, C, K, true);
+scan_default_headers([_ | Rest], H, C, K, U) ->
+    scan_default_headers(Rest, H, C, K, U).
+
+-spec maybe_add_content_length(headers(), iodata() | stream, boolean()) -> headers().
+maybe_add_content_length(Headers, _, true) ->
     Headers;
-add_content_length_header(Headers, <<>>) ->
+maybe_add_content_length(Headers, stream, _) ->
     Headers;
-add_content_length_header(Headers, Body) when is_binary(Body); is_list(Body) ->
-    case lists:keyfind(<<"content-length">>, 1, Headers) of
-        false ->
-            Length = iolist_size(Body),
-            [{<<"content-length">>, integer_to_binary(Length)} | Headers];
-        _ ->
-            Headers
-    end.
-
--spec add_connection_header(headers()) -> headers().
-add_connection_header(Headers) ->
-    case lists:keyfind(<<"connection">>, 1, Headers) of
-        false -> [{<<"connection">>, <<"keep-alive">>} | Headers];
-        _ -> Headers
-    end.
+maybe_add_content_length(Headers, <<>>, _) ->
+    Headers;
+maybe_add_content_length(Headers, Body, false) when is_binary(Body); is_list(Body) ->
+    Length = iolist_size(Body),
+    [{<<"content-length">>, integer_to_binary(Length)} | Headers].
 
 -spec add_chunked_encoding(headers()) -> headers().
 add_chunked_encoding(Headers) ->
@@ -596,14 +629,54 @@ handle_data(Conn, Data) ->
         true ->
             {error, Conn, {application_error, buffer_overflow}, []};
         false ->
-            case parse_responses(Conn#gen_http_h1_conn{buffer = NewBuffer}, []) of
-                {ok, NewConn, Responses} ->
+            %% Try the fast path first without copying Buffer into the conn record.
+            %% fast_body_path/2 only needs the conn + buffer; it builds the updated
+            %% conn internally, saving one 13-element tuple copy on every recv call
+            %% during body reading.
+            case fast_body_path(Conn, NewBuffer) of
+                {fast, NewConn, Responses} ->
                     reactivate_socket_if_needed(Transport, Socket, Mode, NewConn),
                     {ok, NewConn, Responses};
-                {error, NewConn, Reason, Responses} ->
-                    {error, NewConn, Reason, Responses}
+                normal ->
+                    Conn1 = Conn#gen_http_h1_conn{buffer = NewBuffer},
+                    case parse_responses(Conn1, []) of
+                        {ok, NewConn, RevResponses} ->
+                            reactivate_socket_if_needed(Transport, Socket, Mode, NewConn),
+                            {ok, NewConn, lists:reverse(RevResponses)};
+                        {error, NewConn, Reason, RevResponses} ->
+                            {error, NewConn, Reason, lists:reverse(RevResponses)}
+                    end
             end
     end.
+
+%% @doc Fast path for the common hot-path: mid-body content-length reading
+%% where the buffer doesn't complete the body. Skips the full parse chain
+%% (parse_responses → handle_response_parsing → parse_response → parse_body).
+%% Buffer is passed separately so handle_data can skip one conn record copy.
+-spec fast_body_path(conn(), binary()) -> {fast, conn(), [response()]} | normal.
+fast_body_path(
+    #gen_http_h1_conn{
+        current_request =
+            #request_state{
+                body_state = {content_length, Total},
+                ref = Ref,
+                bytes_received = BytesReceived
+            } = ReqState
+    } = Conn,
+    Buffer
+) ->
+    Remaining = Total - BytesReceived,
+    case byte_size(Buffer) < Remaining of
+        true ->
+            NewReqState = ReqState#request_state{
+                bytes_received = BytesReceived + byte_size(Buffer)
+            },
+            {fast, Conn#gen_http_h1_conn{current_request = NewReqState, buffer = <<>>}, [{data, Ref, Buffer}]};
+        false ->
+            normal
+    end;
+fast_body_path(_, _) ->
+    normal.
 
 -spec reactivate_socket_if_needed(module(), socket(), active | passive, conn()) -> ok.
 reactivate_socket_if_needed(Transport, Socket, active, #gen_http_h1_conn{state = open}) ->
@@ -614,25 +687,44 @@ reactivate_socket_if_needed(_, _, _, _) ->
 -spec parse_responses(conn(), [response()]) ->
     {ok, conn(), [response()]} | {error, conn(), term(), [response()]}.
 parse_responses(Conn, Acc) ->
-    case queue:out(Conn#gen_http_h1_conn.requests) of
-        {empty, _} ->
-            {ok, Conn, Acc};
-        {{value, ReqState}, RestRequests} ->
-            handle_response_parsing(Conn, ReqState, RestRequests, Acc)
+    case Conn#gen_http_h1_conn.current_request of
+        undefined ->
+            %% No active request — try to promote the next pipelined request.
+            case queue:out(Conn#gen_http_h1_conn.requests) of
+                {empty, _} ->
+                    {ok, Conn, Acc};
+                {{value, ReqState}, RestRequests} ->
+                    NewConn = Conn#gen_http_h1_conn{
+                        current_request = ReqState,
+                        requests = RestRequests
+                    },
+                    handle_response_parsing(NewConn, Acc)
+            end;
+        _ ->
+            handle_response_parsing(Conn, Acc)
     end.
 
--spec handle_response_parsing(conn(), request_state(), queue:queue(request_state()), [response()]) ->
+%% Acc is kept in reverse order — handle_data does a single lists:reverse
+%% at the end. lists:reverse(Responses, Acc) prepends the (small, typically
+%% 1-4 element) forward-order Responses list onto the reverse Acc.
+-spec handle_response_parsing(conn(), [response()]) ->
     {ok, conn(), [response()]} | {error, conn(), term(), [response()]}.
-handle_response_parsing(Conn, ReqState, RestRequests, Acc) ->
+handle_response_parsing(Conn, Acc) ->
+    ReqState = Conn#gen_http_h1_conn.current_request,
     Buffer = Conn#gen_http_h1_conn.buffer,
     case parse_response(Buffer, ReqState) of
         {done, Responses, NewReqState, RestBuffer} ->
-            NewConn = Conn#gen_http_h1_conn{requests = RestRequests, buffer = RestBuffer},
-            maybe_close_and_continue(NewConn, NewReqState, Acc ++ Responses);
+            NewConn = Conn#gen_http_h1_conn{
+                current_request = undefined,
+                buffer = RestBuffer
+            },
+            maybe_close_and_continue(NewConn, NewReqState, lists:reverse(Responses, Acc));
         {continue, Responses, NewReqState, RestBuffer} ->
-            NewRequests = queue:in_r(NewReqState, RestRequests),
-            NewConn = Conn#gen_http_h1_conn{requests = NewRequests, buffer = RestBuffer},
-            {ok, NewConn, Acc ++ Responses};
+            NewConn = Conn#gen_http_h1_conn{
+                current_request = NewReqState,
+                buffer = RestBuffer
+            },
+            {ok, NewConn, lists:reverse(Responses, Acc)};
         {error, Reason} ->
             NewConn = Conn#gen_http_h1_conn{state = closed},
             {error, NewConn, Reason, Acc}
@@ -750,13 +842,13 @@ parse_content_length_body(Buffer, ReqState, Total) ->
     case byte_size(Buffer) >= Remaining of
         true ->
             <<Body:Remaining/binary, Rest/binary>> = Buffer,
+            NewReqState = ReqState#request_state{body_state = done},
             Responses =
                 case Body of
-                    <<>> -> [];
-                    _ -> [{data, Ref, Body}]
+                    <<>> -> [{done, Ref}];
+                    _ -> [{data, Ref, Body}, {done, Ref}]
                 end,
-            NewReqState = ReqState#request_state{body_state = done},
-            {done, Responses ++ [{done, Ref}], NewReqState, Rest};
+            {done, Responses, NewReqState, Rest};
         false ->
             NewReqState = ReqState#request_state{
                 bytes_received = BytesReceived + byte_size(Buffer)
@@ -809,20 +901,20 @@ parse_chunk_data(Buffer, ReqState, Ref, Size) ->
     case byte_size(Buffer) >= Size + 2 of
         true ->
             <<ChunkData:Size/binary, "\r\n", Rest/binary>> = Buffer,
-            Responses =
-                case ChunkData of
-                    <<>> -> [];
-                    _ -> [{data, Ref, ChunkData}]
-                end,
-            %% Continue reading next chunk
             NewReqState = ReqState#request_state{body_state = {chunked, reading_size}},
-            case parse_chunk_size(Rest, NewReqState, Ref) of
-                {done, MoreResponses, FinalReqState, FinalRest} ->
-                    {done, Responses ++ MoreResponses, FinalReqState, FinalRest};
-                {continue, MoreResponses, FinalReqState, FinalRest} ->
-                    {continue, Responses ++ MoreResponses, FinalReqState, FinalRest};
-                {error, Reason} ->
-                    {error, Reason}
+            case ChunkData of
+                <<>> ->
+                    parse_chunk_size(Rest, NewReqState, Ref);
+                _ ->
+                    DataResp = {data, Ref, ChunkData},
+                    case parse_chunk_size(Rest, NewReqState, Ref) of
+                        {done, More, FinalReqState, FinalRest} ->
+                            {done, [DataResp | More], FinalReqState, FinalRest};
+                        {continue, More, FinalReqState, FinalRest} ->
+                            {continue, [DataResp | More], FinalReqState, FinalRest};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end
             end;
         false ->
             %% Need more data
@@ -836,27 +928,59 @@ determine_body_state(Status, _Headers) when Status =:= 204; Status =:= 304 ->
 determine_body_state(Status, _Headers) when Status >= 100, Status =< 199 ->
     done;
 determine_body_state(_Status, Headers) ->
-    case lists:keyfind(<<"transfer-encoding">>, 1, Headers) of
-        {_, <<"chunked">>} ->
+    %% Extract transfer-encoding and content-length in a single pass.
+    %% Uses byte_size dispatch to skip irrelevant headers efficiently.
+    extract_body_params(Headers, undefined, undefined).
+
+-spec extract_body_params(headers(), binary() | undefined, binary() | undefined) ->
+    done | {content_length, non_neg_integer()} | {chunked, reading_size} | until_close.
+extract_body_params([], TransferEncoding, ContentLength) ->
+    case TransferEncoding of
+        <<"chunked">> ->
             {chunked, reading_size};
         _ ->
-            case lists:keyfind(<<"content-length">>, 1, Headers) of
-                {_, LengthBin} ->
-                    Length = binary_to_integer(LengthBin),
-                    case Length of
+            case ContentLength of
+                undefined ->
+                    until_close;
+                LengthBin ->
+                    case binary_to_integer(LengthBin) of
                         0 -> done;
-                        _ -> {content_length, Length}
-                    end;
-                false ->
-                    until_close
+                        Length -> {content_length, Length}
+                    end
             end
+    end;
+extract_body_params([{Name, Value} | Rest], TE, CL) ->
+    case byte_size(Name) of
+        17 ->
+            case Name of
+                <<"transfer-encoding">> -> extract_body_params(Rest, Value, CL);
+                _ -> extract_body_params(Rest, TE, CL)
+            end;
+        14 ->
+            case Name of
+                <<"content-length">> -> extract_body_params(Rest, TE, Value);
+                _ -> extract_body_params(Rest, TE, CL)
+            end;
+        _ ->
+            extract_body_params(Rest, TE, CL)
     end.
 
 -spec should_close_connection(request_state()) -> boolean().
 should_close_connection(#request_state{response_headers = Headers}) ->
-    case lists:keyfind(<<"connection">>, 1, Headers) of
-        {_, <<"close">>} -> true;
-        _ -> false
+    find_connection_close(Headers).
+
+-spec find_connection_close(headers()) -> boolean().
+find_connection_close([]) ->
+    false;
+find_connection_close([{Name, Value} | Rest]) ->
+    case byte_size(Name) of
+        10 ->
+            case Name of
+                <<"connection">> -> Value =:= <<"close">>;
+                _ -> find_connection_close(Rest)
+            end;
+        _ ->
+            find_connection_close(Rest)
     end.
 
 %%====================================================================
@@ -866,8 +990,15 @@ should_close_connection(#request_state{response_headers = Headers}) ->
 -spec handle_closed(conn()) ->
     {error, conn(), gen_http:error_reason(), [response()]}.
 handle_closed(Conn) ->
-    Responses = generate_close_responses(Conn#gen_http_h1_conn.requests),
-    NewConn = Conn#gen_http_h1_conn{state = closed, requests = queue:new()},
+    AllRequests =
+        case Conn#gen_http_h1_conn.current_request of
+            undefined -> Conn#gen_http_h1_conn.requests;
+            CurrentReq -> queue:in_r(CurrentReq, Conn#gen_http_h1_conn.requests)
+        end,
+    Responses = generate_close_responses(AllRequests),
+    NewConn = Conn#gen_http_h1_conn{
+        state = closed, current_request = undefined, requests = queue:new()
+    },
     {error, NewConn, application_error(connection_closed), Responses}.
 
 -spec generate_close_responses(queue:queue(request_state())) -> [response()].
@@ -886,8 +1017,15 @@ generate_close_response(#request_state{ref = Ref}, Acc) ->
 -spec handle_error(conn(), term()) ->
     {error, conn(), gen_http:error_reason(), [response()]}.
 handle_error(Conn, Reason) ->
-    Responses = generate_error_responses(Conn#gen_http_h1_conn.requests, Reason),
-    NewConn = Conn#gen_http_h1_conn{state = closed, requests = queue:new()},
+    AllRequests =
+        case Conn#gen_http_h1_conn.current_request of
+            undefined -> Conn#gen_http_h1_conn.requests;
+            CurrentReq -> queue:in_r(CurrentReq, Conn#gen_http_h1_conn.requests)
+        end,
+    Responses = generate_error_responses(AllRequests, Reason),
+    NewConn = Conn#gen_http_h1_conn{
+        state = closed, current_request = undefined, requests = queue:new()
+    },
     {error, NewConn, transport_error(Reason), Responses}.
 
 -spec generate_error_responses(queue:queue(request_state()), term()) -> [response()].

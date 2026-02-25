@@ -39,29 +39,33 @@ connect(Address, Port, Opts) ->
             _ -> Address
         end,
 
-    %% Default buffer sizes optimized for HTTP traffic (64KB - high throughput)
-    DefaultBufSize = 65536,
-
-    SocketOpts = [
+    %% Base socket options. Don't hardcode sndbuf/recbuf — let the OS
+    %% auto-tune them (macOS default ~400KB, Linux ~128KB). The
+    %% optimize_buffer/1 call after connect sets the Erlang-level
+    %% buffer to max(sndbuf, recbuf, buffer) so recv returns large
+    %% chunks. Users can still override via socket_opts or top-level
+    %% sndbuf/recbuf options.
+    BaseOpts = [
         binary,
         {packet, raw},
         {active, false},
         {nodelay, true},
-        %% Buffer tuning (fasthttp pattern)
-        {sndbuf, proplists:get_value(sndbuf, Opts, DefaultBufSize)},
-        {recbuf, proplists:get_value(recbuf, Opts, DefaultBufSize)},
-        %% Socket reuse
         {reuseaddr, true},
-        %% Keepalive configuration
         {keepalive, proplists:get_value(keepalive, Opts, true)},
-        %% Send timeout (5 seconds default)
         {send_timeout, proplists:get_value(send_timeout, Opts, 5000)},
-        %% Close socket if send times out
         {send_timeout_close, true}
-        | proplists:get_value(socket_opts, Opts, [])
     ],
+    %% Allow explicit sndbuf/recbuf override via transport_opts
+    BufOverrides = [{K, V} || {K, V} <- Opts, K =:= sndbuf orelse K =:= recbuf],
+    SocketOpts = BaseOpts ++ BufOverrides ++ proplists:get_value(socket_opts, Opts, []),
     Timeout = proplists:get_value(timeout, Opts, 5000),
-    gen_tcp:connect(NormalizedAddress, Port, SocketOpts, Timeout).
+    case gen_tcp:connect(NormalizedAddress, Port, SocketOpts, Timeout) of
+        {ok, Socket} ->
+            optimize_buffer(Socket),
+            {ok, Socket};
+        {error, _} = Err ->
+            Err
+    end.
 
 %% @doc Upgrade is not supported for plain TCP transport.
 %%
@@ -131,3 +135,25 @@ sockname(Socket) ->
 -spec getstat(socket()) -> {ok, [{atom(), integer()}]} | {error, term()}.
 getstat(Socket) ->
     inet:getstat(Socket).
+
+%% @doc Optimize the Erlang-level buffer to match OS socket buffers.
+%%
+%% Queries the actual sndbuf/recbuf/buffer sizes from the OS and sets
+%% the Erlang-level buffer to the maximum of the three. This ensures
+%% Erlang can take advantage of kernel auto-tuning.
+-spec optimize_buffer(socket()) -> ok.
+optimize_buffer(Socket) ->
+    case inet:getopts(Socket, [sndbuf, recbuf, buffer]) of
+        {ok, Opts} ->
+            SndBuf = proplists:get_value(sndbuf, Opts, 0),
+            RecBuf = proplists:get_value(recbuf, Opts, 0),
+            Buffer = proplists:get_value(buffer, Opts, 0),
+            NewBuffer = max(SndBuf, max(RecBuf, Buffer)),
+            case NewBuffer > Buffer of
+                true -> inet:setopts(Socket, [{buffer, NewBuffer}]);
+                false -> ok
+            end;
+        {error, _} ->
+            ok
+    end,
+    ok.
