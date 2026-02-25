@@ -793,16 +793,49 @@ parse_headers(Buffer, ReqState, HeadersAcc) ->
 
 handle_headers_complete(Rest, ReqState, Headers) ->
     HeadersResp = {headers, ReqState#request_state.ref, Headers},
-    BodyState = determine_body_state(ReqState#request_state.status, Headers),
-    NewReqState = ReqState#request_state{response_headers = Headers, body_state = BodyState},
+    Status = ReqState#request_state.status,
+    BodyState = determine_body_state(Status, Headers),
 
-    case BodyState of
-        done ->
-            DoneResp = {done, ReqState#request_state.ref},
-            {done, [HeadersResp, DoneResp], NewReqState, Rest};
-        _ ->
-            combine_header_and_body_responses(Rest, NewReqState, HeadersResp)
+    %% RFC 9110 Section 15.2 / RFC 9112 Section 9.2:
+    %% Client MUST be able to parse one or more 1xx responses before final response.
+    %% After a 1xx response, continue parsing for the next response.
+    case is_informational_status(Status) of
+        true ->
+            %% Reset request state to parse the next response (could be another 1xx or final)
+            ResetReqState = ReqState#request_state{
+                status = undefined,
+                response_headers = [],
+                body_state = undefined,
+                bytes_received = 0
+            },
+            %% Continue parsing without emitting {done, ...}
+            case parse_response(Rest, ResetReqState) of
+                {done, MoreResponses, FinalReqState, FinalRest} ->
+                    {done, [HeadersResp | MoreResponses], FinalReqState, FinalRest};
+                {continue, MoreResponses, FinalReqState, FinalRest} ->
+                    {continue, [HeadersResp | MoreResponses], FinalReqState, FinalRest};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        false ->
+            %% Non-1xx response - handle normally
+            NewReqState = ReqState#request_state{response_headers = Headers, body_state = BodyState},
+            case BodyState of
+                done ->
+                    %% No body (204, 304, etc.)
+                    DoneResp = {done, ReqState#request_state.ref},
+                    {done, [HeadersResp, DoneResp], NewReqState, Rest};
+                _ ->
+                    %% Has body, continue parsing
+                    combine_header_and_body_responses(Rest, NewReqState, HeadersResp)
+            end
     end.
+
+%% @doc Check if a status code is informational (1xx).
+%% RFC 9110 Section 15.2: 1xx responses are interim responses.
+-spec is_informational_status(status()) -> boolean().
+is_informational_status(Status) when Status >= 100, Status =< 199 -> true;
+is_informational_status(_) -> false.
 
 -spec combine_header_and_body_responses(binary(), request_state(), response()) ->
     {done, [response()], request_state(), binary()}

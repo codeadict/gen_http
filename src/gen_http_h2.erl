@@ -1009,38 +1009,60 @@ emit_header_events(Conn, StreamId, Stream, Headers, Status, NewHpackDecode, EndS
     %% For internal storage, strip all pseudo-headers.
     StoredHeaders = remove_pseudo_headers(Headers),
 
-    %% RFC 7540 §5.1: Determine correct state transition.
-    %% half_closed_local + remote END_STREAM → closed (fully done)
-    StreamFullyClosed = EndStream andalso Stream#stream_state.state =:= half_closed_local,
+    %% RFC 9113 Section 8.1: Informational responses (1xx) do not terminate the request.
+    %% The HEADERS frame that carries an informational response does not have END_STREAM set.
+    %% Client MUST be able to receive one or more 1xx responses before the final response.
+    case is_informational_status(Status) of
+        true ->
+            %% 1xx informational response - emit headers but don't store in stream state.
+            %% Stream continues waiting for the final (non-1xx) response.
+            Conn2 = Conn#gen_http_h2_conn{hpack_decode = NewHpackDecode},
+            %% Clear headers buffer since we've processed this HEADERS frame
+            NewStream = Stream#stream_state{headers_buffer = <<>>},
+            Conn3 = update_stream(Conn2, StreamId, NewStream),
+            HeaderEvent = {headers, Stream#stream_state.ref, StreamId, EventHeaders},
+            {ok, Conn3, [HeaderEvent]};
+        false ->
+            %% Final (non-1xx) response - store status/headers in stream state
+            %% RFC 7540 §5.1: Determine correct state transition.
+            %% half_closed_local + remote END_STREAM → closed (fully done)
+            StreamFullyClosed = EndStream andalso Stream#stream_state.state =:= half_closed_local,
 
-    Conn2 =
-        case StreamFullyClosed of
-            true ->
-                %% Stream is done — remove from map to free resources
-                remove_stream(Conn, StreamId);
-            false ->
-                NewStreamState =
-                    case EndStream of
-                        true -> half_closed_remote;
-                        false -> Stream#stream_state.state
-                    end,
-                NewStream = Stream#stream_state{
-                    status = Status,
-                    response_headers = StoredHeaders,
-                    headers_buffer = <<>>,
-                    state = NewStreamState
-                },
-                update_stream(Conn, StreamId, NewStream)
-        end,
+            Conn2 =
+                case StreamFullyClosed of
+                    true ->
+                        %% Stream is done — remove from map to free resources
+                        remove_stream(Conn, StreamId);
+                    false ->
+                        NewStreamState =
+                            case EndStream of
+                                true -> half_closed_remote;
+                                false -> Stream#stream_state.state
+                            end,
+                        NewStream = Stream#stream_state{
+                            status = Status,
+                            response_headers = StoredHeaders,
+                            headers_buffer = <<>>,
+                            state = NewStreamState
+                        },
+                        update_stream(Conn, StreamId, NewStream)
+                end,
 
-    Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
-    HeaderEvent = {headers, Stream#stream_state.ref, StreamId, EventHeaders},
-    DoneEvent =
-        case EndStream of
-            true -> [{done, Stream#stream_state.ref, StreamId}];
-            false -> []
-        end,
-    {ok, Conn3, [HeaderEvent | DoneEvent]}.
+            Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
+            HeaderEvent = {headers, Stream#stream_state.ref, StreamId, EventHeaders},
+            DoneEvent =
+                case EndStream of
+                    true -> [{done, Stream#stream_state.ref, StreamId}];
+                    false -> []
+                end,
+            {ok, Conn3, [HeaderEvent | DoneEvent]}
+    end.
+
+%% @doc Check if a status code is informational (1xx).
+%% RFC 9110 Section 15.2: 1xx responses are interim responses.
+-spec is_informational_status(status()) -> boolean().
+is_informational_status(Status) when Status >= 100, Status =< 199 -> true;
+is_informational_status(_) -> false.
 
 %% @doc Handle DATA frame (response body).
 -spec handle_data_frame(conn(), stream_id(), #data{}) ->

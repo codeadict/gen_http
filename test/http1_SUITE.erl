@@ -30,7 +30,11 @@
 
     % Headers and body
     response_headers/1,
-    chunked_response/1
+    chunked_response/1,
+
+    % Informational responses
+    informational_100_continue/1,
+    informational_103_early_hints/1
 ]).
 
 %%====================================================================
@@ -42,7 +46,8 @@ all() ->
         {group, basic_http},
         {group, response_types},
         {group, connection_mgmt},
-        {group, headers_body}
+        {group, headers_body},
+        {group, informational_responses}
     ].
 
 groups() ->
@@ -65,6 +70,10 @@ groups() ->
         {headers_body, [parallel], [
             response_headers,
             chunked_response
+        ]},
+        {informational_responses, [sequence], [
+            informational_100_continue,
+            informational_103_early_hints
         ]}
     ].
 
@@ -297,4 +306,66 @@ chunked_response(_Config) ->
     ?assertEqual(1024, byte_size(Body)),
 
     {ok, _} = gen_http_h1:close(Conn3),
+    ok.
+
+%%====================================================================
+%% Informational Responses (1xx)
+%%====================================================================
+
+%% @doc Test 100 Continue informational response
+informational_100_continue(_Config) ->
+    ct:pal("Testing 100 Continue"),
+
+    {ok, ListenSocket} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(ListenSocket),
+
+    spawn_link(fun() ->
+        {ok, Socket} = gen_tcp:accept(ListenSocket),
+        {ok, _} = gen_tcp:recv(Socket, 0, 5000),
+        ok = gen_tcp:send(Socket, <<"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK">>),
+        gen_tcp:close(Socket)
+    end),
+
+    {ok, Conn} = gen_http_h1:connect(http, "localhost", Port, #{mode => passive}),
+    {ok, Conn2, _Ref} = gen_http_h1:request(Conn, <<"POST">>, <<"/">>, [{<<"expect">>, <<"100-continue">>}], <<"data">>),
+
+    {ok, Conn3, Responses} = gen_http_h1:recv(Conn2, 0, 5000),
+
+    Statuses = [S || {status, _, S} <- Responses],
+    ?assertEqual([100, 200], Statuses),
+
+    gen_http_h1:close(Conn3),
+
+    gen_http_h1:close(Conn3),
+    gen_tcp:close(ListenSocket),
+    ok.
+
+%% @doc Test 103 Early Hints informational response
+informational_103_early_hints(_Config) ->
+    ct:pal("Testing 103 Early Hints"),
+
+    {ok, ListenSocket} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(ListenSocket),
+
+    spawn_link(fun() ->
+        {ok, Socket} = gen_tcp:accept(ListenSocket),
+        {ok, _} = gen_tcp:recv(Socket, 0, 5000),
+        ok = gen_tcp:send(Socket, <<"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK">>),
+        gen_tcp:close(Socket)
+    end),
+
+    {ok, Conn} = gen_http_h1:connect(http, "localhost", Port, #{mode => passive}),
+    {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/">>, [], <<>>),
+
+    {ok, Conn3, Responses} = gen_http_h1:recv(Conn2, 0, 5000),
+
+    Statuses = [S || {status, _, S} <- Responses],
+    ?assertEqual([103, 200], Statuses),
+
+    %% Verify Link header in 103 response
+    Headers103 = [H || {headers, R, H} <- Responses, R =:= Ref, lists:keymember(<<"link">>, 1, H)],
+    ?assertMatch([_], Headers103),
+
+    gen_http_h1:close(Conn3),
+    gen_tcp:close(ListenSocket),
     ok.
