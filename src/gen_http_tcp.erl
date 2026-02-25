@@ -143,17 +143,18 @@ getstat(Socket) ->
 %% Erlang can take advantage of kernel auto-tuning.
 -spec optimize_buffer(socket()) -> ok.
 optimize_buffer(Socket) ->
-    case inet:getopts(Socket, [sndbuf, recbuf, buffer]) of
-        {ok, Opts} ->
-            SndBuf = proplists:get_value(sndbuf, Opts, 0),
-            RecBuf = proplists:get_value(recbuf, Opts, 0),
-            Buffer = proplists:get_value(buffer, Opts, 0),
-            NewBuffer = max(SndBuf, max(RecBuf, Buffer)),
-            case NewBuffer > Buffer of
-                true -> inet:setopts(Socket, [{buffer, NewBuffer}]);
-                false -> ok
-            end;
-        {error, _} ->
-            ok
-    end,
+    _ =
+        case inet:getopts(Socket, [sndbuf, recbuf, buffer]) of
+            {ok, Opts} ->
+                SndBuf = proplists:get_value(sndbuf, Opts, 0),
+                RecBuf = proplists:get_value(recbuf, Opts, 0),
+                Buffer = proplists:get_value(buffer, Opts, 0),
+                NewBuffer = max(SndBuf, max(RecBuf, Buffer)),
+                case NewBuffer > Buffer of
+                    true -> _ = inet:setopts(Socket, [{buffer, NewBuffer}]);
+                    false -> ok
+                end;
+            {error, _} ->
+                ok
+        end,
     ok.
