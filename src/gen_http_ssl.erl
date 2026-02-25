@@ -44,22 +44,27 @@ connect(Address, Port, Opts) ->
     AlpnProtocols = get_alpn_protocols(Opts, [<<"h2">>, <<"http/1.1">>]),
     Timeout = proplists:get_value(timeout, Opts, 5000),
 
-    %% Default buffer sizes optimized for HTTPS traffic (64KB - high throughput)
-    DefaultBufSize = 65536,
+    %% SNI (Server Name Indication) tells the TLS server which hostname
+    %% the client is connecting to.  Reverse proxies like Fly.io rely on
+    %% SNI to route to the right backend.  Only set it when the address
+    %% is a hostname string — IP tuples must not carry SNI.
+    SniOpts =
+        case is_list(NormalizedAddress) of
+            true -> [{server_name_indication, NormalizedAddress}];
+            false -> []
+        end,
 
-    %% Base SSL options
+    %% Base SSL options. Don't hardcode sndbuf/recbuf — let the OS
+    %% auto-tune. optimize_buffer/1 sets the Erlang-level buffer to
+    %% max(sndbuf, recbuf, buffer) after connect.
     BaseOpts = [
         binary,
         {packet, raw},
         {active, false},
         {alpn_advertised_protocols, AlpnProtocols},
-        %% Buffer tuning (fasthttp pattern)
-        {sndbuf, proplists:get_value(sndbuf, Opts, DefaultBufSize)},
-        {recbuf, proplists:get_value(recbuf, Opts, DefaultBufSize)},
-        %% Socket reuse
         {reuseaddr, true},
-        %% TLS session reuse (TLS 1.3 optimization)
         {reuse_sessions, true}
+        | SniOpts ++ [{K, V} || {K, V} <- Opts, K =:= sndbuf orelse K =:= recbuf]
     ],
 
     %% Add verification options (verify_peer by default)
@@ -83,7 +88,13 @@ connect(Address, Port, Opts) ->
     %% Combine all options
     SocketOpts = BaseOpts ++ VerifyOpts ++ proplists:get_value(socket_opts, Opts, []),
 
-    ssl:connect(NormalizedAddress, Port, SocketOpts, Timeout).
+    case ssl:connect(NormalizedAddress, Port, SocketOpts, Timeout) of
+        {ok, Socket} ->
+            optimize_buffer(Socket),
+            {ok, Socket};
+        {error, _} = Err ->
+            Err
+    end.
 
 %% @doc Upgrade a plain TCP socket to TLS with ALPN support.
 %%
@@ -174,6 +185,27 @@ sockname(Socket) ->
 -spec getstat(socket()) -> {ok, [{atom(), integer()}]} | {error, term()}.
 getstat(_Socket) ->
     {error, not_supported}.
+
+%% @doc Optimize the Erlang-level buffer to match OS socket buffers.
+%%
+%% Queries the actual sndbuf/recbuf/buffer sizes and sets the
+%% Erlang-level buffer to the maximum of the three.
+-spec optimize_buffer(socket()) -> ok.
+optimize_buffer(Socket) ->
+    case ssl:getopts(Socket, [sndbuf, recbuf, buffer]) of
+        {ok, Opts} ->
+            SndBuf = proplists:get_value(sndbuf, Opts, 0),
+            RecBuf = proplists:get_value(recbuf, Opts, 0),
+            Buffer = proplists:get_value(buffer, Opts, 0),
+            NewBuffer = max(SndBuf, max(RecBuf, Buffer)),
+            case NewBuffer > Buffer of
+                true -> ssl:setopts(Socket, [{buffer, NewBuffer}]);
+                false -> ok
+            end;
+        {error, _} ->
+            ok
+    end,
+    ok.
 
 %%====================================================================
 %% Internal functions

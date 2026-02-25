@@ -23,6 +23,7 @@
         server_max_frame_size/1,
         max_header_block_size/1,
         update_stream/3,
+        remove_stream/2,
         transport_error/1,
         protocol_error/1,
         application_error/1
@@ -78,6 +79,30 @@
     | {push_promise, reference(), stream_id(), stream_id(), headers()}
     | {error, reference(), stream_id(), term()}.
 
+%%====================================================================
+%% HTTP/2 Constants
+%%====================================================================
+
+-define(CONNECTION_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
+%% Use 8MB window size (125x the RFC default of 65535).
+%% Larger windows reduce WINDOW_UPDATE frame overhead for real payloads.
+-define(DEFAULT_WINDOW_SIZE, 8000000).
+-define(MAX_FRAME_SIZE, 16384).
+%% Cap accumulated header block size to prevent CONTINUATION flood (CVE-2024-27316)
+-define(MAX_HEADER_BLOCK_SIZE, 65536).
+%% RFC 7540 Section 6.9.1: flow control window must not exceed 2^31-1
+-define(MAX_WINDOW_SIZE, 2147483647).
+
+%% Default settings
+-define(DEFAULT_SETTINGS, #{
+    header_table_size => 4096,
+    enable_push => false,
+    max_concurrent_streams => 100,
+    initial_window_size => ?DEFAULT_WINDOW_SIZE,
+    max_frame_size => ?MAX_FRAME_SIZE,
+    max_header_list_size => undefined
+}).
+
 -record(gen_http_h2_conn, {
     %% Transport
     transport :: module(),
@@ -101,9 +126,9 @@
     max_concurrent = 100 :: pos_integer(),
 
     %% Flow Control
-    send_window = 65535 :: non_neg_integer(),
-    recv_window = 65535 :: non_neg_integer(),
-    initial_window_size = 65535 :: pos_integer(),
+    send_window = ?DEFAULT_WINDOW_SIZE :: non_neg_integer(),
+    recv_window = ?DEFAULT_WINDOW_SIZE :: non_neg_integer(),
+    initial_window_size = ?DEFAULT_WINDOW_SIZE :: pos_integer(),
 
     %% Settings
     local_settings = #{} :: map(),
@@ -148,28 +173,6 @@
 
 -type conn() :: #gen_http_h2_conn{}.
 -type stream_state() :: #stream_state{}.
-
-%%====================================================================
-%% HTTP/2 Constants
-%%====================================================================
-
--define(CONNECTION_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
--define(DEFAULT_WINDOW_SIZE, 65535).
--define(MAX_FRAME_SIZE, 16384).
-%% Cap accumulated header block size to prevent CONTINUATION flood (CVE-2024-27316)
--define(MAX_HEADER_BLOCK_SIZE, 65536).
-%% RFC 7540 Section 6.9.1: flow control window must not exceed 2^31-1
--define(MAX_WINDOW_SIZE, 2147483647).
-
-%% Default settings
--define(DEFAULT_SETTINGS, #{
-    header_table_size => 4096,
-    enable_push => false,
-    max_concurrent_streams => 100,
-    initial_window_size => ?DEFAULT_WINDOW_SIZE,
-    max_frame_size => ?MAX_FRAME_SIZE,
-    max_header_list_size => undefined
-}).
 
 %%====================================================================
 %% API Functions
@@ -472,13 +475,18 @@ ensure_binary(Addr) when is_binary(Addr) -> Addr;
 ensure_binary(Addr) when is_list(Addr) -> list_to_binary(Addr);
 ensure_binary(Addr) when is_atom(Addr) -> atom_to_binary(Addr, utf8).
 
-%% @doc Send connection preface and initial SETTINGS frame.
+%% @doc Send connection preface, initial SETTINGS, and connection-level WINDOW_UPDATE.
+%%
+%% The SETTINGS frame advertises our stream-level initial_window_size.
+%% RFC 7540 Section 6.9.2: the connection-level window starts at 65535
+%% and can only be increased via WINDOW_UPDATE, so we send one to raise
+%% it to DEFAULT_WINDOW_SIZE.
 -spec send_preface(conn()) -> conn().
 send_preface(Conn) ->
     #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
 
     %% Send magic string
-    ok = Transport:send(Socket, ?CONNECTION_PREFACE),
+    Preface = ?CONNECTION_PREFACE,
 
     %% Send initial SETTINGS frame (filter out undefined values)
     AllParams = maps:to_list(Conn#gen_http_h2_conn.local_settings),
@@ -487,8 +495,19 @@ send_preface(Conn) ->
         stream_id = 0,
         params = FilteredParams
     },
-    Encoded = gen_http_parser_h2:encode(Settings),
-    ok = Transport:send(Socket, Encoded),
+    EncodedSettings = gen_http_parser_h2:encode(Settings),
+
+    %% Send connection-level WINDOW_UPDATE to raise from RFC default (65535)
+    %% to our desired window size. Batched into a single send with the preface.
+    ConnWindowIncrement = ?DEFAULT_WINDOW_SIZE - 65535,
+    WindowUpdate = #window_update{
+        stream_id = 0,
+        window_size_increment = ConnWindowIncrement
+    },
+    WindowUpdateData = gen_http_parser_h2:encode(WindowUpdate),
+
+    %% Single batched send: preface + SETTINGS + WINDOW_UPDATE
+    ok = Transport:send(Socket, [Preface, EncodedSettings, WindowUpdateData]),
 
     Conn#gen_http_h2_conn{preface_sent = true}.
 
@@ -531,8 +550,16 @@ send_request(Conn, Method, Path, Headers, Body) ->
                 {<<":authority">>, Authority}
             ],
 
+            %% Add default user-agent if not provided
+            HasUA = lists:keymember(<<"user-agent">>, 1, Headers),
+            UserHeaders =
+                case HasUA of
+                    true -> Headers;
+                    false -> [{<<"user-agent">>, <<"gen_http/0.1">>} | Headers]
+                end,
+
             %% Combine with user headers
-            AllHeaders = PseudoHeaders ++ Headers,
+            AllHeaders = PseudoHeaders ++ UserHeaders,
 
             %% Encode headers with HPACK
             {ok, HeaderBlock, NewHpackEncode} = gen_http_parser_hpack:encode(
@@ -603,8 +630,11 @@ format_authority(Host, Port) -> <<Host/binary, ":", (integer_to_binary(Port))/bi
 send_frame(Conn, Frame) ->
     #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
     Encoded = gen_http_parser_h2:encode(Frame),
-    ok = Transport:send(Socket, Encoded),
-    Conn.
+    case Transport:send(Socket, Encoded) of
+        ok -> Conn;
+        {error, closed} -> Conn#gen_http_h2_conn{state = closed};
+        {error, Reason} -> error({send_error, Reason})
+    end.
 
 -spec send_data_frame(conn(), stream_id(), iodata() | eof, boolean()) ->
     {ok, conn()} | {error, conn(), term()}.
@@ -971,21 +1001,40 @@ decode_and_emit_headers(Conn, StreamId, Stream, HeaderBlock, EndStream) ->
 ) ->
     {ok, conn(), [h2_response()]}.
 emit_header_events(Conn, StreamId, Stream, Headers, Status, NewHpackDecode, EndStream) ->
-    RealHeaders = remove_pseudo_headers(Headers),
-    NewStreamState =
-        case EndStream of
-            true -> half_closed_remote;
-            false -> Stream#stream_state.state
+    %% Remove all pseudo-headers *except* :status from the event headers.
+    %% The unified layer (gen_http) extracts :status to emit a separate
+    %% {status, Ref, Code} event, and direct gen_http_h2 callers can also
+    %% read it from the headers list.
+    EventHeaders = remove_pseudo_headers_except_status(Headers),
+    %% For internal storage, strip all pseudo-headers.
+    StoredHeaders = remove_pseudo_headers(Headers),
+
+    %% RFC 7540 §5.1: Determine correct state transition.
+    %% half_closed_local + remote END_STREAM → closed (fully done)
+    StreamFullyClosed = EndStream andalso Stream#stream_state.state =:= half_closed_local,
+
+    Conn2 =
+        case StreamFullyClosed of
+            true ->
+                %% Stream is done — remove from map to free resources
+                remove_stream(Conn, StreamId);
+            false ->
+                NewStreamState =
+                    case EndStream of
+                        true -> half_closed_remote;
+                        false -> Stream#stream_state.state
+                    end,
+                NewStream = Stream#stream_state{
+                    status = Status,
+                    response_headers = StoredHeaders,
+                    headers_buffer = <<>>,
+                    state = NewStreamState
+                },
+                update_stream(Conn, StreamId, NewStream)
         end,
-    NewStream = Stream#stream_state{
-        status = Status,
-        response_headers = RealHeaders,
-        headers_buffer = <<>>,
-        state = NewStreamState
-    },
-    Conn2 = update_stream(Conn, StreamId, NewStream),
+
     Conn3 = Conn2#gen_http_h2_conn{hpack_decode = NewHpackDecode},
-    HeaderEvent = {headers, Stream#stream_state.ref, StreamId, RealHeaders},
+    HeaderEvent = {headers, Stream#stream_state.ref, StreamId, EventHeaders},
     DoneEvent =
         case EndStream of
             true -> [{done, Stream#stream_state.ref, StreamId}];
@@ -1002,53 +1051,77 @@ handle_data_frame(Conn, StreamId, #data{flags = Flags, data = Data}) ->
             EndStream = gen_http_parser_h2:is_flag_set(Flags, data, end_stream),
             DataSize = byte_size(Data),
 
+            %% RFC 7540 §5.1: half_closed_local + remote END_STREAM → closed
+            StreamFullyClosed = EndStream andalso Stream#stream_state.state =:= half_closed_local,
+
             %% Update flow control windows
             NewRecvWindow = Stream#stream_state.recv_window - DataSize,
             ConnRecvWindow = Conn#gen_http_h2_conn.recv_window - DataSize,
 
-            %% Check if we need to send WINDOW_UPDATE
-            Conn2 =
-                case NewRecvWindow < (?DEFAULT_WINDOW_SIZE div 2) of
+            %% Batch WINDOW_UPDATE frames into a single send to reduce syscalls.
+            %% Skip stream-level WINDOW_UPDATE if the stream is being closed
+            %% (no more data will arrive on this stream).
+            {StreamWuData, FinalStreamWindow} =
+                case StreamFullyClosed of
                     true ->
-                        %% Replenish stream window
-                        Increment = ?DEFAULT_WINDOW_SIZE - NewRecvWindow,
-                        WindowUpdate = #window_update{
-                            stream_id = StreamId,
-                            window_size_increment = Increment
-                        },
-                        send_frame(Conn, WindowUpdate);
+                        {<<>>, NewRecvWindow};
                     false ->
-                        Conn
+                        case NewRecvWindow < (?DEFAULT_WINDOW_SIZE div 2) of
+                            true ->
+                                Increment = ?DEFAULT_WINDOW_SIZE - NewRecvWindow,
+                                StreamWu = #window_update{
+                                    stream_id = StreamId,
+                                    window_size_increment = Increment
+                                },
+                                {gen_http_parser_h2:encode(StreamWu), NewRecvWindow + Increment};
+                            false ->
+                                {<<>>, NewRecvWindow}
+                        end
                 end,
 
-            Conn3 =
+            {ConnWuData, FinalConnWindow} =
                 case ConnRecvWindow < (?DEFAULT_WINDOW_SIZE div 2) of
                     true ->
-                        %% Replenish connection window
                         Increment2 = ?DEFAULT_WINDOW_SIZE - ConnRecvWindow,
-                        WindowUpdate2 = #window_update{
+                        ConnWu = #window_update{
                             stream_id = 0,
                             window_size_increment = Increment2
                         },
-                        send_frame(Conn2, WindowUpdate2);
+                        {gen_http_parser_h2:encode(ConnWu), ConnRecvWindow + Increment2};
                     false ->
-                        Conn2
+                        {<<>>, ConnRecvWindow}
                 end,
 
-            %% Update stream state
-            NewStreamState =
-                case EndStream of
-                    true -> half_closed_remote;
-                    false -> Stream#stream_state.state
+            Conn3 =
+                case {StreamWuData, ConnWuData} of
+                    {<<>>, <<>>} ->
+                        Conn;
+                    _ ->
+                        #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
+                        ok = Transport:send(Socket, [StreamWuData, ConnWuData]),
+                        Conn
                 end,
 
-            NewStream = Stream#stream_state{
-                recv_window = NewRecvWindow,
-                state = NewStreamState
-            },
+            %% Update or remove stream
+            Conn4 =
+                case StreamFullyClosed of
+                    true ->
+                        %% Stream is done — remove from map to free resources
+                        remove_stream(Conn3, StreamId);
+                    false ->
+                        NewStreamState =
+                            case EndStream of
+                                true -> half_closed_remote;
+                                false -> Stream#stream_state.state
+                            end,
+                        NewStream = Stream#stream_state{
+                            recv_window = FinalStreamWindow,
+                            state = NewStreamState
+                        },
+                        update_stream(Conn3, StreamId, NewStream)
+                end,
 
-            Conn4 = update_stream(Conn3, StreamId, NewStream),
-            Conn5 = Conn4#gen_http_h2_conn{recv_window = ConnRecvWindow},
+            Conn5 = Conn4#gen_http_h2_conn{recv_window = FinalConnWindow},
 
             %% Generate response events
             DataEvent = {data, Stream#stream_state.ref, StreamId, Data},
@@ -1171,9 +1244,8 @@ handle_goaway_frame(Conn, LastStreamId, ErrorCode, _DebugData) ->
 handle_rst_stream_frame(Conn, StreamId, ErrorCode) ->
     case maps:find(StreamId, Conn#gen_http_h2_conn.streams) of
         {ok, Stream} ->
-            %% Mark stream as closed
-            NewStream = Stream#stream_state{state = closed},
-            Conn2 = update_stream(Conn, StreamId, NewStream),
+            %% Remove stream — RST_STREAM terminates it immediately
+            Conn2 = remove_stream(Conn, StreamId),
 
             %% Generate error event
             Response = {error, Stream#stream_state.ref, StreamId, {rst_stream, ErrorCode}},
@@ -1308,6 +1380,17 @@ remove_pseudo_headers(Headers) ->
         Headers
     ).
 
+-spec remove_pseudo_headers_except_status(headers()) -> headers().
+remove_pseudo_headers_except_status(Headers) ->
+    lists:filter(
+        fun
+            ({<<":status">>, _}) -> true;
+            ({<<$:, _/binary>>, _}) -> false;
+            ({_, _}) -> true
+        end,
+        Headers
+    ).
+
 -spec update_all_stream_windows(conn(), integer()) ->
     {ok, conn()} | {error, conn(), term()}.
 update_all_stream_windows(Conn, Delta) ->
@@ -1353,6 +1436,16 @@ handle_error(Conn, Reason) ->
 -spec update_stream(conn(), stream_id(), stream_state()) -> conn().
 update_stream(Conn, StreamId, Stream) ->
     Streams = maps:put(StreamId, Stream, Conn#gen_http_h2_conn.streams),
+    Conn#gen_http_h2_conn{streams = Streams}.
+
+%% @doc Remove a fully closed stream from the streams map.
+%%
+%% Called when both endpoints have sent END_STREAM (RFC 7540 §5.1).
+%% Frees resources and keeps the stream count accurate for
+%% `max_concurrent_streams` enforcement.
+-spec remove_stream(conn(), stream_id()) -> conn().
+remove_stream(Conn, StreamId) ->
+    Streams = maps:remove(StreamId, Conn#gen_http_h2_conn.streams),
     Conn#gen_http_h2_conn{streams = Streams}.
 
 -spec reactivate_socket_if_needed(module(), socket(), active | passive, conn()) -> ok.

@@ -95,6 +95,48 @@ decode_response_header(Data) ->
 %%%===================================================================
 
 -spec header_name(atom() | binary()) -> binary().
+%% Pre-mapped common HTTP response headers — avoids atom_to_binary + string:lowercase
+%% per response. erlang:decode_packet returns atoms for well-known headers.
+header_name('Cache-Control') ->
+    <<"cache-control">>;
+header_name('Connection') ->
+    <<"connection">>;
+header_name('Content-Encoding') ->
+    <<"content-encoding">>;
+header_name('Content-Length') ->
+    <<"content-length">>;
+header_name('Content-Type') ->
+    <<"content-type">>;
+header_name('Date') ->
+    <<"date">>;
+header_name('Etag') ->
+    <<"etag">>;
+header_name('Expires') ->
+    <<"expires">>;
+header_name('Last-Modified') ->
+    <<"last-modified">>;
+header_name('Location') ->
+    <<"location">>;
+header_name('Server') ->
+    <<"server">>;
+header_name('Set-Cookie') ->
+    <<"set-cookie">>;
+header_name('Transfer-Encoding') ->
+    <<"transfer-encoding">>;
+header_name('Vary') ->
+    <<"vary">>;
+header_name('Accept-Ranges') ->
+    <<"accept-ranges">>;
+header_name('Age') ->
+    <<"age">>;
+header_name('Access-Control-Allow-Origin') ->
+    <<"access-control-allow-origin">>;
+header_name('Content-Disposition') ->
+    <<"content-disposition">>;
+header_name('Strict-Transport-Security') ->
+    <<"strict-transport-security">>;
+header_name('X-Content-Type-Options') ->
+    <<"x-content-type-options">>;
 header_name(Name) when is_atom(Name) ->
     string:lowercase(atom_to_binary(Name, utf8));
 header_name(Name) when is_binary(Name) ->
@@ -147,14 +189,16 @@ validate_target(<<>>, _OriginalTarget) ->
 validate_header_name(Name) when is_list(Name) ->
     validate_header_name(list_to_binary(Name));
 validate_header_name(Name) ->
-    [
-        case is_tchar(Char) of
-            true -> ok;
-            false -> throw({gen_http, {invalid_header_name, Name}})
-        end
-     || <<Char>> <= Name
-    ],
-    ok.
+    validate_header_name_loop(Name, Name).
+
+-spec validate_header_name_loop(binary(), binary()) -> ok.
+validate_header_name_loop(<<>>, _Orig) ->
+    ok;
+validate_header_name_loop(<<Char, Rest/binary>>, Orig) ->
+    case is_tchar(Char) of
+        true -> validate_header_name_loop(Rest, Orig);
+        false -> throw({gen_http, {invalid_header_name, Orig}})
+    end.
 
 -spec validate_header_value(binary() | list(), binary() | list()) -> ok.
 validate_header_value(Name, Value) when is_list(Name) ->
@@ -162,14 +206,16 @@ validate_header_value(Name, Value) when is_list(Name) ->
 validate_header_value(Name, Value) when is_list(Value) ->
     validate_header_value(Name, list_to_binary(Value));
 validate_header_value(Name, Value) when is_binary(Name) andalso is_binary(Value) ->
-    [
-        case is_vchar(Char) orelse Char =:= $\s orelse Char =:= $\t of
-            true -> ok;
-            false -> throw({gen_http, {invalid_header_value, Name, Value}})
-        end
-     || <<Char>> <= Value
-    ],
-    ok.
+    validate_header_value_loop(Name, Value, Value).
+
+-spec validate_header_value_loop(binary(), binary(), binary()) -> ok.
+validate_header_value_loop(_Name, <<>>, _Orig) ->
+    ok;
+validate_header_value_loop(Name, <<Char, Rest/binary>>, Orig) ->
+    case is_vchar(Char) orelse Char =:= $\s orelse Char =:= $\t of
+        true -> validate_header_value_loop(Name, Rest, Orig);
+        false -> throw({gen_http, {invalid_header_value, Name, Orig}})
+    end.
 
 %%------------------------------------------------------------------------------------------
 %% As specified in [RFC 3986, section 2.3](https://tools.ietf.org/html/rfc3986#section-2.3),
