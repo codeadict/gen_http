@@ -192,19 +192,20 @@ getstat(_Socket) ->
 %% Erlang-level buffer to the maximum of the three.
 -spec optimize_buffer(socket()) -> ok.
 optimize_buffer(Socket) ->
-    case ssl:getopts(Socket, [sndbuf, recbuf, buffer]) of
-        {ok, Opts} ->
-            SndBuf = proplists:get_value(sndbuf, Opts, 0),
-            RecBuf = proplists:get_value(recbuf, Opts, 0),
-            Buffer = proplists:get_value(buffer, Opts, 0),
-            NewBuffer = max(SndBuf, max(RecBuf, Buffer)),
-            case NewBuffer > Buffer of
-                true -> ssl:setopts(Socket, [{buffer, NewBuffer}]);
-                false -> ok
-            end;
-        {error, _} ->
-            ok
-    end,
+    _ =
+        case ssl:getopts(Socket, [sndbuf, recbuf, buffer]) of
+            {ok, Opts} ->
+                SndBuf = proplists:get_value(sndbuf, Opts, 0),
+                RecBuf = proplists:get_value(recbuf, Opts, 0),
+                Buffer = proplists:get_value(buffer, Opts, 0),
+                NewBuffer = max(SndBuf, max(RecBuf, Buffer)),
+                case NewBuffer > Buffer of
+                    true -> _ = ssl:setopts(Socket, [{buffer, NewBuffer}]);
+                    false -> ok
+                end;
+            {error, _} ->
+                ok
+        end,
     ok.
 
 %%====================================================================
