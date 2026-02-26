@@ -78,16 +78,11 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Check if docker-compose services are available
-    case test_helper:is_server_available() of
-        true ->
-            ct:pal("Docker services are available"),
-            Config;
-        false ->
-            {skip, "Docker services not available. Run: docker compose -f test/support/docker-compose.yml up -d"}
-    end.
+    {ok, Pid, Port} = test_helper:start_mock(),
+    [{mock_pid, Pid}, {http_port, Port} | Config].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    test_helper:stop_mock(?config(mock_pid, Config)),
     ok.
 
 init_per_testcase(_TestCase, Config) ->
@@ -100,17 +95,16 @@ end_per_testcase(_TestCase, _Config) ->
 %% Test Cases
 %%====================================================================
 
-simple_get(_Config) ->
+simple_get(Config) ->
     ct:pal("Testing simple GET request"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
     ?assert(gen_http_h1:is_open(Conn)),
 
     Headers = [{<<"user-agent">>, <<"gen_http_test/1.0">>}],
     {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/get">>, Headers, <<>>),
 
-    %% Collect response
     {Conn3, Response} = test_helper:collect_response(Conn2, Ref, 5000),
     ?assertMatch(#{status := 200}, Response),
     ?assert(maps:is_key(headers, Response)),
@@ -119,11 +113,11 @@ simple_get(_Config) ->
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-simple_post(_Config) ->
+simple_post(Config) ->
     ct:pal("Testing simple POST request"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     Headers = [
         {<<"content-type">>, <<"application/json">>},
@@ -136,7 +130,6 @@ simple_post(_Config) ->
     {Conn3, Response} = test_helper:collect_response(Conn2, Ref, 5000),
     ?assertMatch(#{status := 200}, Response),
 
-    %% httpbin echoes back the posted data
     ResponseBody = maps:get(body, Response),
     ?assert(binary:match(ResponseBody, <<"test">>) =/= nomatch),
     ?assert(binary:match(ResponseBody, <<"42">>) =/= nomatch),
@@ -144,11 +137,11 @@ simple_post(_Config) ->
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-post_with_json_body(_Config) ->
+post_with_json_body(Config) ->
     ct:pal("Testing POST with JSON body"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     Headers = [{<<"content-type">>, <<"application/json">>}],
     Body = <<"{\"key\": \"value\"}">>,
@@ -161,11 +154,11 @@ post_with_json_body(_Config) ->
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-get_with_query_params(_Config) ->
+get_with_query_params(Config) ->
     ct:pal("Testing GET with query params"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/get?foo=bar&baz=qux">>, [], <<>>),
 
@@ -178,11 +171,11 @@ get_with_query_params(_Config) ->
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-status_404(_Config) ->
+status_404(Config) ->
     ct:pal("Testing 404 response"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     Headers = [{<<"user-agent">>, <<"gen_http_test/1.0">>}],
     {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/status/404">>, Headers, <<>>),
@@ -193,11 +186,11 @@ status_404(_Config) ->
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-status_redirect(_Config) ->
+status_redirect(Config) ->
     ct:pal("Testing redirect response"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     Headers = [{<<"user-agent">>, <<"gen_http_test/1.0">>}],
     {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/redirect/1">>, Headers, <<>>),
@@ -205,18 +198,17 @@ status_redirect(_Config) ->
     {Conn3, Response} = test_helper:collect_response(Conn2, Ref, 5000),
     ?assertMatch(#{status := 302}, Response),
 
-    %% Should have Location header
     Headers2 = maps:get(headers, Response),
     ?assert(lists:keyfind(<<"location">>, 1, Headers2) =/= false),
 
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-large_response_body(_Config) ->
+large_response_body(Config) ->
     ct:pal("Testing large response body"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     %% Request 10KB of data
     {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/bytes/10240">>, [], <<>>),
@@ -230,11 +222,11 @@ large_response_body(_Config) ->
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-connection_reuse(_Config) ->
+connection_reuse(Config) ->
     ct:pal("Testing connection reuse"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     %% First request
     {ok, Conn2, Ref1} = gen_http_h1:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
@@ -250,11 +242,11 @@ connection_reuse(_Config) ->
     {ok, _} = gen_http_h1:close(Conn5),
     ok.
 
-pipelining(_Config) ->
+pipelining(Config) ->
     ct:pal("Testing pipelining"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     %% Send two requests without waiting for responses
     {ok, Conn2, Ref1} = gen_http_h1:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
@@ -270,11 +262,11 @@ pipelining(_Config) ->
     {ok, _} = gen_http_h1:close(Conn5),
     ok.
 
-response_headers(_Config) ->
+response_headers(Config) ->
     ct:pal("Testing response headers"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/response-headers?Foo=Bar&Baz=Qux">>, [], <<>>),
 
@@ -290,11 +282,11 @@ response_headers(_Config) ->
     {ok, _} = gen_http_h1:close(Conn3),
     ok.
 
-chunked_response(_Config) ->
+chunked_response(Config) ->
     ct:pal("Testing chunked response"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
 
-    {ok, Conn} = gen_http_h1:connect(http, Host, Port),
+    {ok, Conn} = gen_http_h1:connect(http, "127.0.0.1", Port),
 
     %% /stream-bytes streams the response in chunks
     {ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"GET">>, <<"/stream-bytes/1024">>, [], <<>>),

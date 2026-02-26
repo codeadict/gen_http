@@ -367,6 +367,89 @@ encode_chunk_with_iodata_test() ->
      || {Input, Expected} <- Cases
     ].
 
+encode_chunk_eof_with_trailers_test() ->
+    Result = iolist_to_binary(encode_chunk({eof, [{<<"x-checksum">>, <<"abc">>}]})),
+    ?assertEqual(<<"0\r\nx-checksum: abc\r\n\r\n">>, Result).
+
+encode_request_stream_body_test() ->
+    ?assertEqual(
+        <<"GET / HTTP/1.1\r\n\r\n">>,
+        encode_request_helper("GET", "/", [], stream)
+    ).
+
+decode_status_valid_test() ->
+    ?assertMatch(
+        {ok, {{1, 1}, 200, <<"OK">>}, <<"rest">>},
+        decode_response_status_line(<<"HTTP/1.1 200 OK\r\nrest">>)
+    ).
+
+decode_status_not_response_test() ->
+    %% A request line instead of a response triggers the _Other clause.
+    ?assertEqual(error, decode_response_status_line(<<"GET / HTTP/1.1\r\n">>)).
+
+decode_status_more_test() ->
+    ?assertEqual(more, decode_response_status_line(<<"HTTP/1.1 2">>)).
+
+decode_status_error_test() ->
+    ?assertEqual(error, decode_response_status_line(<<0, 0, 13, 10>>)).
+
+decode_header_known_atoms_test() ->
+    %% Headers that OTP's decode_packet returns as atoms, exercising
+    %% the header_name/1 atom clauses. Each input needs trailing data
+    %% after \r\n so decode_packet doesn't return `more`.
+    Cases = [
+        {<<"Content-Type: text/html\r\n\r\n">>, <<"content-type">>, <<"text/html">>},
+        {<<"Content-Length: 42\r\n\r\n">>, <<"content-length">>, <<"42">>},
+        {<<"Server: nginx\r\n\r\n">>, <<"server">>, <<"nginx">>},
+        {<<"Date: Mon, 01 Jan 2024\r\n\r\n">>, <<"date">>, <<"Mon, 01 Jan 2024">>},
+        {<<"Cache-Control: no-cache\r\n\r\n">>, <<"cache-control">>, <<"no-cache">>},
+        {<<"Connection: keep-alive\r\n\r\n">>, <<"connection">>, <<"keep-alive">>},
+        {<<"Content-Encoding: gzip\r\n\r\n">>, <<"content-encoding">>, <<"gzip">>},
+        {<<"Etag: \"abc\"\r\n\r\n">>, <<"etag">>, <<"\"abc\"">>},
+        {<<"Expires: Thu, 01 Jan 2025\r\n\r\n">>, <<"expires">>, <<"Thu, 01 Jan 2025">>},
+        {<<"Last-Modified: Fri, 02 Feb\r\n\r\n">>, <<"last-modified">>, <<"Fri, 02 Feb">>},
+        {<<"Location: /new\r\n\r\n">>, <<"location">>, <<"/new">>},
+        {<<"Set-Cookie: a=b\r\n\r\n">>, <<"set-cookie">>, <<"a=b">>},
+        {<<"Transfer-Encoding: chunked\r\n\r\n">>, <<"transfer-encoding">>, <<"chunked">>},
+        {<<"Vary: Accept\r\n\r\n">>, <<"vary">>, <<"Accept">>},
+        {<<"Accept-Ranges: bytes\r\n\r\n">>, <<"accept-ranges">>, <<"bytes">>},
+        {<<"Age: 600\r\n\r\n">>, <<"age">>, <<"600">>}
+    ],
+    lists:foreach(
+        fun({Input, ExpName, ExpVal}) ->
+            ?assertMatch({ok, {ExpName, ExpVal}, _}, decode_response_header(Input))
+        end,
+        Cases
+    ).
+
+decode_header_unknown_binary_test() ->
+    %% Unknown header: decode_packet returns it as binary, exercises
+    %% the is_binary clause of header_name/1.
+    ?assertMatch(
+        {ok, {<<"x-custom-header">>, <<"val">>}, _},
+        decode_response_header(<<"X-Custom-Header: val\r\n\r\n">>)
+    ).
+
+decode_header_eof_test() ->
+    ?assertMatch({ok, eof, _}, decode_response_header(<<"\r\nrest">>)).
+
+decode_header_more_test() ->
+    ?assertEqual(more, decode_response_header(<<"Content-Ty">>)).
+
+encode_target_all_reserved_chars_test() ->
+    %% Target containing all RFC 3986 reserved characters.
+    Target = <<"/a:b?c=d&e#f@g[h]i!j$k'l(m)n*o+p,q;r">>,
+    {ok, _} = encode_request(<<"GET">>, Target, [], undefined).
+
+encode_target_unreserved_chars_test() ->
+    Target = <<"/a-b.c_d~e">>,
+    {ok, _} = encode_request(<<"GET">>, Target, [], undefined).
+
+encode_header_tchar_chars_test() ->
+    %% Header name with tchar characters beyond alpha/digit.
+    Name = <<"x!#$%&'*+-.^_`|~z">>,
+    {ok, _} = encode_request(<<"GET">>, <<"/">>, [{Name, <<"v">>}], undefined).
+
 encode_request_helper(Method, Target, Headers, Body) ->
     {ok, IoData} = encode_request(Method, Target, Headers, Body),
     iolist_to_binary(IoData).

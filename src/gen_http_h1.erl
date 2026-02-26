@@ -878,18 +878,22 @@ is_informational_status(_) -> false.
 
 -spec combine_header_and_body_responses(binary(), request_state(), response()) ->
     {done, [response()], request_state(), binary()}
-    | {continue, [response()], request_state(), binary()}.
+    | {continue, [response()], request_state(), binary()}
+    | {error, term()}.
 combine_header_and_body_responses(Rest, NewReqState, HeadersResp) ->
     case parse_body(Rest, NewReqState) of
         {done, BodyResponses, FinalReqState, FinalRest} ->
             {done, [HeadersResp | BodyResponses], FinalReqState, FinalRest};
         {continue, BodyResponses, FinalReqState, FinalRest} ->
-            {continue, [HeadersResp | BodyResponses], FinalReqState, FinalRest}
+            {continue, [HeadersResp | BodyResponses], FinalReqState, FinalRest};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 -spec parse_body(binary(), request_state()) ->
     {done, [response()], request_state(), binary()}
-    | {continue, [response()], request_state(), binary()}.
+    | {continue, [response()], request_state(), binary()}
+    | {error, term()}.
 parse_body(Buffer, #request_state{body_state = done, ref = Ref} = ReqState) ->
     {done, [{done, Ref}], ReqState, Buffer};
 parse_body(Buffer, #request_state{body_state = {content_length, Total}} = ReqState) ->

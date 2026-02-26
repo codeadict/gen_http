@@ -88,16 +88,24 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Check if docker-compose services are available
-    case test_helper:is_server_available() of
-        true ->
-            ct:pal("Docker services are available"),
-            Config;
-        false ->
-            {skip, "Docker services not available. Run: docker compose -f test/support/docker-compose.yml up -d"}
+    {ok, MockPid, MockPort} = test_helper:start_mock(),
+    case test_helper:start_nghttpx(MockPort) of
+        {ok, NghttpxInfo} ->
+            [
+                {mock_pid, MockPid},
+                {http_port, MockPort},
+                {https_port, maps:get(port, NghttpxInfo)},
+                {nghttpx_info, NghttpxInfo}
+                | Config
+            ];
+        {skip, _} = Skip ->
+            test_helper:stop_mock(MockPid),
+            Skip
     end.
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    test_helper:stop_nghttpx(?config(nghttpx_info, Config)),
+    test_helper:stop_mock(?config(mock_pid, Config)),
     ok.
 
 init_per_testcase(_TestCase, Config) ->
@@ -110,19 +118,19 @@ end_per_testcase(_TestCase, _Config) ->
 %% SSL Connection Tests
 %%====================================================================
 
-connect_to_https_server(_Config) ->
+connect_to_https_server(Config) ->
     ct:pal("Testing SSL connection to HTTPS server"),
-    {https, Host, Port} = test_helper:https_server(),
-    Result = gen_http_ssl:connect(Host, Port, [{verify, verify_none}]),
+    Port = ?config(https_port, Config),
+    Result = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_none}]),
     ?assertMatch({ok, _Socket}, Result),
     {ok, Socket} = Result,
     ok = gen_http_ssl:close(Socket),
     ok.
 
-connect_with_verify_none(_Config) ->
+connect_with_verify_none(Config) ->
     ct:pal("Testing SSL connection without certificate verification"),
-    {https, Host, Port} = test_helper:https_server(),
-    Result = gen_http_ssl:connect(Host, Port, [{verify, verify_none}]),
+    Port = ?config(https_port, Config),
+    Result = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_none}]),
     ?assertMatch({ok, _Socket}, Result),
     {ok, Socket} = Result,
     ok = gen_http_ssl:close(Socket),
@@ -135,34 +143,33 @@ connect_timeout(_Config) ->
     ?assertMatch({error, _}, Result),
     ok.
 
-certificate_verification(_Config) ->
+certificate_verification(Config) ->
     ct:pal("Testing certificate verification"),
-    {https, Host, Port} = test_helper:https_server(),
+    Port = ?config(https_port, Config),
 
-    %% Test with self-signed certificate (should fail with verify_peer)
-    Result1 = gen_http_ssl:connect(Host, Port, [{verify, verify_peer}]),
-    %% Self-signed cert should fail verification
+    %% Self-signed cert should fail with verify_peer
+    Result1 = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_peer}]),
     ?assertMatch({error, _}, Result1),
 
     %% With verify_none should succeed
-    Result2 = gen_http_ssl:connect(Host, Port, [{verify, verify_none}]),
+    Result2 = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_none}]),
     ?assertMatch({ok, _}, Result2),
     {ok, Socket2} = Result2,
     ok = gen_http_ssl:close(Socket2),
     ok.
 
 %%====================================================================
-%% ALPN Tests
+%% ALPN Tests — nghttpx advertises h2,http/1.1
 %%====================================================================
 
-alpn_negotiation(_Config) ->
+alpn_negotiation(Config) ->
     ct:pal("Testing ALPN negotiation"),
-    %% Connect to a server that supports HTTP/2 (e.g., google.com)
-    {ok, Socket} = gen_http_ssl:connect("google.com", 443, [
+    Port = ?config(https_port, Config),
+    {ok, Socket} = gen_http_ssl:connect("127.0.0.1", Port, [
+        {verify, verify_none},
         {alpn_advertise, [<<"h2">>, <<"http/1.1">>]}
     ]),
 
-    %% Check negotiated protocol
     Result = gen_http_ssl:negotiated_protocol(Socket),
     ?assertMatch(
         {ok, Protocol} when Protocol =:= <<"h2">> orelse Protocol =:= <<"http/1.1">>,
@@ -172,17 +179,17 @@ alpn_negotiation(_Config) ->
     ok = gen_http_ssl:close(Socket),
     ok.
 
-alpn_http2_preference(_Config) ->
+alpn_http2_preference(Config) ->
     ct:pal("Testing ALPN HTTP/2 preference"),
-    %% Many modern servers prefer HTTP/2, test with a known HTTP/2 server
-    {ok, Socket} = gen_http_ssl:connect("www.google.com", 443, []),
+    Port = ?config(https_port, Config),
+    {ok, Socket} = gen_http_ssl:connect("127.0.0.1", Port, [
+        {verify, verify_none}
+    ]),
 
     case gen_http_ssl:negotiated_protocol(Socket) of
         {ok, Protocol} ->
-            %% Should be either h2 or http/1.1
             ?assert(Protocol =:= <<"h2">> orelse Protocol =:= <<"http/1.1">>);
         {error, protocol_not_negotiated} ->
-            %% Some servers might not support ALPN
             ?assert(true)
     end,
 
@@ -193,51 +200,46 @@ alpn_http2_preference(_Config) ->
 %% SSL Socket Operations
 %%====================================================================
 
-send_and_receive(_Config) ->
+send_and_receive(Config) ->
     ct:pal("Testing SSL send and receive operations"),
-    {https, Host, Port} = test_helper:https_server(),
-    {ok, Socket} = gen_http_ssl:connect(Host, Port, [{verify, verify_none}]),
+    Port = ?config(https_port, Config),
+    {ok, Socket} = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_none}]),
 
-    %% Test that we can send data without error
     TestData = <<"GET /get HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n">>,
     ?assertEqual(ok, gen_http_ssl:send(Socket, TestData)),
 
-    %% Test that setopts works for switching to passive mode
     ?assertEqual(ok, gen_http_ssl:setopts(Socket, [{active, false}])),
 
     ok = gen_http_ssl:close(Socket),
     ok.
 
-setopts(_Config) ->
+setopts(Config) ->
     ct:pal("Testing SSL setopts"),
-    {https, Host, Port} = test_helper:https_server(),
-    {ok, Socket} = gen_http_ssl:connect(Host, Port, [{verify, verify_none}]),
+    Port = ?config(https_port, Config),
+    {ok, Socket} = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_none}]),
 
-    %% Test setting active mode
     ?assertEqual(ok, gen_http_ssl:setopts(Socket, [{active, once}])),
     ?assertEqual(ok, gen_http_ssl:setopts(Socket, [{active, false}])),
 
     ok = gen_http_ssl:close(Socket),
     ok.
 
-controlling_process(_Config) ->
+controlling_process(Config) ->
     ct:pal("Testing SSL controlling_process"),
-    {https, Host, Port} = test_helper:https_server(),
-    {ok, Socket} = gen_http_ssl:connect(Host, Port, [{verify, verify_none}]),
+    Port = ?config(https_port, Config),
+    {ok, Socket} = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_none}]),
 
-    %% Transfer to self (should succeed)
     ?assertEqual(ok, gen_http_ssl:controlling_process(Socket, self())),
 
     ok = gen_http_ssl:close(Socket),
     ok.
 
-close(_Config) ->
+close(Config) ->
     ct:pal("Testing SSL close"),
-    {https, Host, Port} = test_helper:https_server(),
-    {ok, Socket} = gen_http_ssl:connect(Host, Port, [{verify, verify_none}]),
+    Port = ?config(https_port, Config),
+    {ok, Socket} = gen_http_ssl:connect("127.0.0.1", Port, [{verify, verify_none}]),
     ?assertEqual(ok, gen_http_ssl:close(Socket)),
 
-    %% Verify socket is closed by trying to send
     Result = gen_http_ssl:send(Socket, "test"),
     ?assertMatch({error, _}, Result),
     ok.
@@ -246,10 +248,10 @@ close(_Config) ->
 %% TCP Connection Tests
 %%====================================================================
 
-tcp_connect_valid_host(_Config) ->
+tcp_connect_valid_host(Config) ->
     ct:pal("Testing TCP connection to valid host"),
-    {http, Host, Port} = test_helper:http_server(),
-    Result = gen_http_tcp:connect(Host, Port, []),
+    Port = ?config(http_port, Config),
+    Result = gen_http_tcp:connect("127.0.0.1", Port, []),
     ?assertMatch({ok, _Socket}, Result),
     {ok, Socket} = Result,
     ok = gen_http_tcp:close(Socket),
@@ -257,15 +259,12 @@ tcp_connect_valid_host(_Config) ->
 
 tcp_connect_timeout(_Config) ->
     ct:pal("Testing TCP connection timeout"),
-    %% Try to connect to an IP that doesn't respond (reserved IP, should timeout)
-    %% Use a very short timeout to speed up the test
     Result = gen_http_tcp:connect("192.0.2.1", 80, [{timeout, 100}]),
     ?assertMatch({error, _}, Result),
     ok.
 
 tcp_connect_refused(_Config) ->
     ct:pal("Testing TCP connection refused"),
-    %% Connect to localhost on a port that's likely not listening
     Result = gen_http_tcp:connect("localhost", 9999, [{timeout, 1000}]),
     ?assertMatch({error, econnrefused}, Result),
     ok.
@@ -274,39 +273,35 @@ tcp_connect_refused(_Config) ->
 %% TCP Socket Operations
 %%====================================================================
 
-tcp_send_and_receive(_Config) ->
+tcp_send_and_receive(Config) ->
     ct:pal("Testing TCP send operations"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Socket} = gen_http_tcp:connect(Host, Port, []),
+    Port = ?config(http_port, Config),
+    {ok, Socket} = gen_http_tcp:connect("127.0.0.1", Port, []),
 
-    %% Test that we can send data without error
     TestData = <<"GET /get HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n">>,
     ?assertEqual(ok, gen_http_tcp:send(Socket, TestData)),
 
-    %% Test that setopts works for switching to passive mode
     ?assertEqual(ok, gen_http_tcp:setopts(Socket, [{active, false}])),
 
     ok = gen_http_tcp:close(Socket),
     ok.
 
-tcp_setopts(_Config) ->
+tcp_setopts(Config) ->
     ct:pal("Testing TCP setopts"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Socket} = gen_http_tcp:connect(Host, Port, []),
+    Port = ?config(http_port, Config),
+    {ok, Socket} = gen_http_tcp:connect("127.0.0.1", Port, []),
 
-    %% Test setting active mode
     ?assertEqual(ok, gen_http_tcp:setopts(Socket, [{active, once}])),
     ?assertEqual(ok, gen_http_tcp:setopts(Socket, [{active, false}])),
 
     ok = gen_http_tcp:close(Socket),
     ok.
 
-tcp_controlling_process(_Config) ->
+tcp_controlling_process(Config) ->
     ct:pal("Testing TCP controlling_process"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Socket} = gen_http_tcp:connect(Host, Port, []),
+    Port = ?config(http_port, Config),
+    {ok, Socket} = gen_http_tcp:connect("127.0.0.1", Port, []),
 
-    %% Transfer to self (should succeed)
     ?assertEqual(ok, gen_http_tcp:controlling_process(Socket, self())),
 
     ok = gen_http_tcp:close(Socket),
@@ -314,25 +309,22 @@ tcp_controlling_process(_Config) ->
 
 tcp_upgrade_not_supported(_Config) ->
     ct:pal("Testing TCP upgrade not supported"),
-    %% TCP upgrade should return not_supported
     Result = gen_http_tcp:upgrade(fake_socket, http, <<"localhost">>, 8080, []),
     ?assertEqual({error, not_supported}, Result),
     ok.
 
 tcp_negotiated_protocol_not_available(_Config) ->
     ct:pal("Testing TCP negotiated_protocol not available"),
-    %% TCP doesn't support ALPN
     Result = gen_http_tcp:negotiated_protocol(fake_socket),
     ?assertEqual({error, protocol_not_negotiated}, Result),
     ok.
 
-tcp_close(_Config) ->
+tcp_close(Config) ->
     ct:pal("Testing TCP close"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Socket} = gen_http_tcp:connect(Host, Port, []),
+    Port = ?config(http_port, Config),
+    {ok, Socket} = gen_http_tcp:connect("127.0.0.1", Port, []),
     ?assertEqual(ok, gen_http_tcp:close(Socket)),
 
-    %% Verify socket is closed by trying to send
     Result = gen_http_tcp:send(Socket, "test"),
     ?assertMatch({error, _}, Result),
     ok.
