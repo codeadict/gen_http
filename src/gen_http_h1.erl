@@ -27,6 +27,12 @@
 
 -include("include/gen_http.hrl").
 
+%% Max hex digits in a chunk size line (16 hex chars = 64-bit max)
+-define(MAX_CHUNK_HEX_LEN, 16).
+%% Hard cap on a single chunk size (~2GB). Prevents allocation attacks
+%% even if the buffer size limit hasn't been hit yet.
+-define(MAX_CHUNK_SIZE, 2147483647).
+
 -export([
     connect/3,
     connect/4,
@@ -39,6 +45,7 @@
     put_log/2,
     close/1,
     is_open/1,
+    is_alive/1,
     get_socket/1,
     put_private/3,
     get_private/2,
@@ -86,6 +93,7 @@
     %% Settings
     max_pipeline = 10 :: pos_integer(),
     max_buffer_size = 1048576 :: pos_integer(),
+    max_header_count = 100 :: pos_integer(),
     log = false :: boolean(),
 
     %% User metadata storage
@@ -148,6 +156,7 @@ connect_impl(Scheme, Address, Port, Opts) ->
     Mode = maps:get(mode, Opts, active),
     MaxPipeline = maps:get(max_pipeline, Opts, 10),
     MaxBufferSize = maps:get(max_buffer_size, Opts, 1048576),
+    MaxHeaderCount = maps:get(max_header_count, Opts, 100),
 
     TransportOpts = maps:get(transport_opts, Opts, []),
 
@@ -168,7 +177,19 @@ connect_impl(Scheme, Address, Port, Opts) ->
     maybe
         {ok, Socket} ?= Transport:connect(Address, Port, ConnectOpts),
         ok ?= setup_socket_mode(Transport, Socket, Mode),
-        Conn = make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline, MaxBufferSize),
+        Conn = make_connection(
+            Transport,
+            Socket,
+            Scheme,
+            Address,
+            Port,
+            #{
+                mode => Mode,
+                max_pipeline => MaxPipeline,
+                max_buffer_size => MaxBufferSize,
+                max_header_count => MaxHeaderCount
+            }
+        ),
         {ok, Conn}
     else
         {error, Reason} -> {error, transport_error({connect_failed, Reason})}
@@ -328,6 +349,22 @@ close(Conn) ->
 is_open(#gen_http_h1_conn{state = State}) ->
     State =:= open.
 
+%% @doc Check if the underlying socket is still alive.
+%%
+%% Does a non-blocking recv to detect if the server has closed the connection
+%% while it was idle. Useful for connection pool implementations that want to
+%% avoid sending requests on stale connections.
+-spec is_alive(conn()) -> boolean().
+is_alive(#gen_http_h1_conn{state = closed}) ->
+    false;
+is_alive(#gen_http_h1_conn{transport = Transport, socket = Socket}) ->
+    case Transport:recv(Socket, 0, 0) of
+        {error, timeout} -> true;
+        {error, closed} -> false;
+        {ok, _Data} -> false;
+        {error, _} -> false
+    end.
+
 %% @doc Get the underlying socket.
 -spec get_socket(conn()) -> socket().
 get_socket(#gen_http_h1_conn{socket = Socket}) ->
@@ -361,7 +398,7 @@ delete_private(#gen_http_h1_conn{private = Private} = Conn, Key) ->
 %% Internal Functions - Connection Setup
 %%====================================================================
 
--define(VALID_OPTS, [timeout, mode, max_pipeline, max_buffer_size, transport_opts, protocols]).
+-define(VALID_OPTS, [timeout, mode, max_pipeline, max_buffer_size, max_header_count, transport_opts, protocols]).
 
 -spec validate_opts(map()) -> ok | {error, {unknown_option, term()}}.
 validate_opts(Opts) ->
@@ -387,17 +424,8 @@ setup_socket_mode(Transport, Socket, active) ->
 setup_socket_mode(_Transport, _Socket, passive) ->
     ok.
 
--spec make_connection(
-    module(),
-    socket(),
-    scheme(),
-    address(),
-    inet:port_number(),
-    active | passive,
-    pos_integer(),
-    pos_integer()
-) -> conn().
-make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline, MaxBufferSize) ->
+-spec make_connection(module(), socket(), scheme(), address(), inet:port_number(), map()) -> conn().
+make_connection(Transport, Socket, Scheme, Address, Port, Settings) ->
     #gen_http_h1_conn{
         transport = Transport,
         socket = Socket,
@@ -405,9 +433,10 @@ make_connection(Transport, Socket, Scheme, Address, Port, Mode, MaxPipeline, Max
         port = Port,
         scheme = Scheme,
         state = open,
-        mode = Mode,
-        max_pipeline = MaxPipeline,
-        max_buffer_size = MaxBufferSize
+        mode = maps:get(mode, Settings),
+        max_pipeline = maps:get(max_pipeline, Settings),
+        max_buffer_size = maps:get(max_buffer_size, Settings),
+        max_header_count = maps:get(max_header_count, Settings)
     }.
 
 -spec check_can_send_request(conn()) -> ok | {error, gen_http:error_reason()}.
@@ -712,7 +741,8 @@ parse_responses(Conn, Acc) ->
 handle_response_parsing(Conn, Acc) ->
     ReqState = Conn#gen_http_h1_conn.current_request,
     Buffer = Conn#gen_http_h1_conn.buffer,
-    case parse_response(Buffer, ReqState) of
+    MaxHeaderCount = Conn#gen_http_h1_conn.max_header_count,
+    case parse_response(Buffer, ReqState, MaxHeaderCount) of
         {done, Responses, NewReqState, RestBuffer} ->
             NewConn = Conn#gen_http_h1_conn{
                 current_request = undefined,
@@ -741,27 +771,27 @@ maybe_close_and_continue(Conn, ReqState, Acc) ->
             parse_responses(Conn, Acc)
     end.
 
--spec parse_response(binary(), request_state()) ->
+-spec parse_response(binary(), request_state(), pos_integer()) ->
     {done, [response()], request_state(), binary()}
     | {continue, [response()], request_state(), binary()}
     | {error, term()}.
-parse_response(Buffer, #request_state{status = undefined} = ReqState) ->
-    parse_status_line(Buffer, ReqState);
-parse_response(Buffer, #request_state{body_state = undefined} = ReqState) ->
-    parse_headers(Buffer, ReqState, []);
-parse_response(Buffer, ReqState) ->
+parse_response(Buffer, #request_state{status = undefined} = ReqState, MaxHeaderCount) ->
+    parse_status_line(Buffer, ReqState, MaxHeaderCount);
+parse_response(Buffer, #request_state{body_state = undefined} = ReqState, MaxHeaderCount) ->
+    parse_headers(Buffer, ReqState, [], 0, MaxHeaderCount);
+parse_response(Buffer, ReqState, _MaxHeaderCount) ->
     parse_body(Buffer, ReqState).
 
--spec parse_status_line(binary(), request_state()) ->
+-spec parse_status_line(binary(), request_state(), pos_integer()) ->
     {done, [response()], request_state(), binary()}
     | {continue, [response()], request_state(), binary()}
     | {error, {protocol_error, invalid_status_line}}.
-parse_status_line(Buffer, ReqState) ->
+parse_status_line(Buffer, ReqState, MaxHeaderCount) ->
     case gen_http_parser_h1:decode_response_status_line(Buffer) of
         {ok, {_Version, StatusCode, _Reason}, Rest} ->
             StatusResp = {status, ReqState#request_state.ref, StatusCode},
             NewReqState = ReqState#request_state{status = StatusCode},
-            case parse_response(Rest, NewReqState) of
+            case parse_response(Rest, NewReqState, MaxHeaderCount) of
                 {done, Responses, FinalReqState, FinalRest} ->
                     {done, [StatusResp | Responses], FinalReqState, FinalRest};
                 {continue, Responses, FinalReqState, FinalRest} ->
@@ -775,26 +805,30 @@ parse_status_line(Buffer, ReqState) ->
             {error, protocol_error(invalid_status_line)}
     end.
 
--spec parse_headers(binary(), request_state(), headers()) ->
+-spec parse_headers(binary(), request_state(), headers(), non_neg_integer(), pos_integer()) ->
     {done, [response()], request_state(), binary()}
     | {continue, [response()], request_state(), binary()}
     | {error, term()}.
-parse_headers(Buffer, ReqState, HeadersAcc) ->
+parse_headers(Buffer, ReqState, HeadersAcc, Count, MaxHeaderCount) ->
     case gen_http_parser_h1:decode_response_header(Buffer) of
         {ok, {Name, Value}, Rest} ->
-            parse_headers(Rest, ReqState, [{Name, Value} | HeadersAcc]);
+            case Count >= MaxHeaderCount of
+                true ->
+                    {error, protocol_error(too_many_headers)};
+                false ->
+                    parse_headers(Rest, ReqState, [{Name, Value} | HeadersAcc], Count + 1, MaxHeaderCount)
+            end;
         {ok, eof, Rest} ->
-            handle_headers_complete(Rest, ReqState, lists:reverse(HeadersAcc));
+            handle_headers_complete(Rest, ReqState, lists:reverse(HeadersAcc), MaxHeaderCount);
         more ->
             {continue, [], ReqState, Buffer};
         error ->
             {error, protocol_error(invalid_header)}
     end.
 
-handle_headers_complete(Rest, ReqState, Headers) ->
+handle_headers_complete(Rest, ReqState, Headers, MaxHeaderCount) ->
     HeadersResp = {headers, ReqState#request_state.ref, Headers},
     Status = ReqState#request_state.status,
-    BodyState = determine_body_state(Status, Headers),
 
     %% RFC 9110 Section 15.2 / RFC 9112 Section 9.2:
     %% Client MUST be able to parse one or more 1xx responses before final response.
@@ -809,7 +843,7 @@ handle_headers_complete(Rest, ReqState, Headers) ->
                 bytes_received = 0
             },
             %% Continue parsing without emitting {done, ...}
-            case parse_response(Rest, ResetReqState) of
+            case parse_status_line(Rest, ResetReqState, MaxHeaderCount) of
                 {done, MoreResponses, FinalReqState, FinalRest} ->
                     {done, [HeadersResp | MoreResponses], FinalReqState, FinalRest};
                 {continue, MoreResponses, FinalReqState, FinalRest} ->
@@ -819,15 +853,20 @@ handle_headers_complete(Rest, ReqState, Headers) ->
             end;
         false ->
             %% Non-1xx response - handle normally
-            NewReqState = ReqState#request_state{response_headers = Headers, body_state = BodyState},
-            case BodyState of
-                done ->
-                    %% No body (204, 304, etc.)
-                    DoneResp = {done, ReqState#request_state.ref},
-                    {done, [HeadersResp, DoneResp], NewReqState, Rest};
-                _ ->
-                    %% Has body, continue parsing
-                    combine_header_and_body_responses(Rest, NewReqState, HeadersResp)
+            case determine_body_state(Status, Headers) of
+                {error, _} = Err ->
+                    Err;
+                BodyState ->
+                    NewReqState = ReqState#request_state{response_headers = Headers, body_state = BodyState},
+                    case BodyState of
+                        done ->
+                            %% No body (204, 304, etc.)
+                            DoneResp = {done, ReqState#request_state.ref},
+                            {done, [HeadersResp, DoneResp], NewReqState, Rest};
+                        _ ->
+                            %% Has body, continue parsing
+                            combine_header_and_body_responses(Rest, NewReqState, HeadersResp)
+                    end
             end
     end.
 
@@ -902,24 +941,24 @@ parse_chunk_size(Buffer, ReqState, Ref) ->
                     [S, _] -> S;
                     [S] -> S
                 end,
-            try binary_to_integer(SizeHexClean, 16) of
-                0 ->
-                    %% Last chunk, consume trailing CRLF
-                    case Rest of
-                        <<"\r\n", FinalRest/binary>> ->
-                            NewReqState = ReqState#request_state{body_state = done},
-                            {done, [{done, Ref}], NewReqState, FinalRest};
-                        _ ->
-                            %% Wait for trailing CRLF
-                            {continue, [], ReqState, Buffer}
-                    end;
-                Size ->
-                    %% Non-zero chunk, read data
-                    NewReqState = ReqState#request_state{body_state = {chunked, {reading_data, Size}}},
-                    parse_chunk_data(Rest, NewReqState, Ref, Size)
-            catch
-                error:badarg ->
-                    {error, protocol_error(invalid_chunk_size)}
+            case byte_size(SizeHexClean) > ?MAX_CHUNK_HEX_LEN of
+                true ->
+                    {error, protocol_error(chunk_size_overflow)};
+                false ->
+                    try binary_to_integer(SizeHexClean, 16) of
+                        0 ->
+                            %% Zero-length chunk. Parse optional trailers.
+                            parse_trailers(Rest, ReqState, Ref, []);
+                        Size when Size > ?MAX_CHUNK_SIZE ->
+                            {error, protocol_error(chunk_size_overflow)};
+                        Size ->
+                            %% Non-zero chunk, read data
+                            NewReqState = ReqState#request_state{body_state = {chunked, {reading_data, Size}}},
+                            parse_chunk_data(Rest, NewReqState, Ref, Size)
+                    catch
+                        error:badarg ->
+                            {error, protocol_error(invalid_chunk_size)}
+                    end
             end;
         [_] ->
             %% No CRLF found yet, need more data
@@ -954,8 +993,34 @@ parse_chunk_data(Buffer, ReqState, Ref, Size) ->
             {continue, [], ReqState, Buffer}
     end.
 
+%% @doc Parse optional trailer headers after the zero-length final chunk.
+%% RFC 9112 Section 7.1.2: trailers may appear between the last chunk and
+%% the final CRLF. When no trailers are present, decode_response_header
+%% returns `{ok, eof, Rest}` on seeing `\r\n` immediately.
+-spec parse_trailers(binary(), request_state(), request_ref(), headers()) ->
+    {done, [response()], request_state(), binary()}
+    | {continue, [response()], request_state(), binary()}
+    | {error, term()}.
+parse_trailers(Buffer, ReqState, Ref, TrailerAcc) ->
+    case gen_http_parser_h1:decode_response_header(Buffer) of
+        {ok, {Name, Value}, Rest} ->
+            parse_trailers(Rest, ReqState, Ref, [{Name, Value} | TrailerAcc]);
+        {ok, eof, Rest} ->
+            NewReqState = ReqState#request_state{body_state = done},
+            Responses =
+                case TrailerAcc of
+                    [] -> [{done, Ref}];
+                    _ -> [{trailers, Ref, lists:reverse(TrailerAcc)}, {done, Ref}]
+                end,
+            {done, Responses, NewReqState, Rest};
+        more ->
+            {continue, [], ReqState, Buffer};
+        error ->
+            {error, protocol_error(invalid_trailer)}
+    end.
+
 -spec determine_body_state(status(), headers()) ->
-    done | {content_length, non_neg_integer()} | {chunked, reading_size} | until_close.
+    done | {content_length, non_neg_integer()} | {chunked, reading_size} | until_close | {error, term()}.
 determine_body_state(Status, _Headers) when Status =:= 204; Status =:= 304 ->
     done;
 determine_body_state(Status, _Headers) when Status >= 100, Status =< 199 ->
@@ -966,7 +1031,7 @@ determine_body_state(_Status, Headers) ->
     extract_body_params(Headers, undefined, undefined).
 
 -spec extract_body_params(headers(), binary() | undefined, binary() | undefined) ->
-    done | {content_length, non_neg_integer()} | {chunked, reading_size} | until_close.
+    done | {content_length, non_neg_integer()} | {chunked, reading_size} | until_close | {error, term()}.
 extract_body_params([], TransferEncoding, ContentLength) ->
     case TransferEncoding of
         <<"chunked">> ->
@@ -991,8 +1056,19 @@ extract_body_params([{Name, Value} | Rest], TE, CL) ->
             end;
         14 ->
             case Name of
-                <<"content-length">> -> extract_body_params(Rest, TE, Value);
-                _ -> extract_body_params(Rest, TE, CL)
+                <<"content-length">> ->
+                    case CL of
+                        undefined ->
+                            extract_body_params(Rest, TE, Value);
+                        Value ->
+                            %% Same value repeated, RFC 9110 §8.6 allows it
+                            extract_body_params(Rest, TE, CL);
+                        _ ->
+                            %% Different value, RFC 9110 §8.6 says reject
+                            {error, protocol_error(conflicting_content_length)}
+                    end;
+                _ ->
+                    extract_body_params(Rest, TE, CL)
             end;
         _ ->
             extract_body_params(Rest, TE, CL)
@@ -1044,6 +1120,13 @@ generate_close_response(#request_state{ref = Ref, body_state = until_close}, Acc
     [{done, Ref} | Acc];
 generate_close_response(#request_state{body_state = done}, Acc) ->
     Acc;
+generate_close_response(
+    #request_state{ref = Ref, body_state = {content_length, Total}, bytes_received = Received},
+    Acc
+) when Received > 0 ->
+    [{error, Ref, application_error({incomplete_body, Received, Total})} | Acc];
+generate_close_response(#request_state{ref = Ref, body_state = {chunked, _}}, Acc) ->
+    [{error, Ref, application_error(incomplete_chunked_body)} | Acc];
 generate_close_response(#request_state{ref = Ref}, Acc) ->
     [{error, Ref, application_error(unexpected_close)} | Acc].
 
@@ -1098,11 +1181,19 @@ transport_error(Other) -> {transport_error, Other}.
     | invalid_status_line
     | invalid_header
     | invalid_chunk_size
+    | chunk_size_overflow
+    | too_many_headers
+    | conflicting_content_length
+    | invalid_trailer
 ) -> gen_http:error_reason().
 protocol_error({encode_failed, _} = E) -> {protocol_error, E};
 protocol_error(invalid_status_line) -> {protocol_error, invalid_status_line};
 protocol_error(invalid_header) -> {protocol_error, invalid_header};
-protocol_error(invalid_chunk_size) -> {protocol_error, invalid_chunk_size}.
+protocol_error(invalid_chunk_size) -> {protocol_error, invalid_chunk_size};
+protocol_error(chunk_size_overflow) -> {protocol_error, chunk_size_overflow};
+protocol_error(too_many_headers) -> {protocol_error, too_many_headers};
+protocol_error(conflicting_content_length) -> {protocol_error, conflicting_content_length};
+protocol_error(invalid_trailer) -> {protocol_error, invalid_trailer}.
 
 %% @doc Wrap application errors in structured format.
 -spec application_error(
@@ -1110,11 +1201,15 @@ protocol_error(invalid_chunk_size) -> {protocol_error, invalid_chunk_size}.
     | pipeline_full
     | {invalid_request_ref, reference()}
     | unexpected_close
+    | {incomplete_body, non_neg_integer(), non_neg_integer()}
+    | incomplete_chunked_body
 ) -> gen_http:error_reason().
 application_error(connection_closed) -> {application_error, connection_closed};
 application_error(pipeline_full) -> {application_error, pipeline_full};
 application_error({invalid_request_ref, _} = E) -> {application_error, E};
-application_error(unexpected_close) -> {application_error, unexpected_close}.
+application_error(unexpected_close) -> {application_error, unexpected_close};
+application_error({incomplete_body, _, _} = E) -> {application_error, E};
+application_error(incomplete_chunked_body) -> {application_error, incomplete_chunked_body}.
 
 %%====================================================================
 %% Internal Functions - Utilities
@@ -1129,3 +1224,234 @@ maybe_concat(<<>>, Data) ->
     Data;
 maybe_concat(Buffer, Data) ->
     <<Buffer/binary, Data/binary>>.
+
+%%====================================================================
+%% Unit Tests
+%%====================================================================
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%%--------------------------------------------------------------------
+%% Header Count Limit Tests
+%%--------------------------------------------------------------------
+
+too_many_headers_test() ->
+    %% Simulate a response with headers exceeding the limit.
+    %% Build a buffer with status line + 5 headers + empty line, limit to 3.
+    StatusLine = <<"HTTP/1.1 200 OK\r\n">>,
+    Headers = iolist_to_binary([
+        <<"h1: v1\r\n">>,
+        <<"h2: v2\r\n">>,
+        <<"h3: v3\r\n">>,
+        <<"h4: v4\r\n">>,
+        <<"h5: v5\r\n">>,
+        <<"\r\n">>
+    ]),
+    Buffer = <<StatusLine/binary, Headers/binary>>,
+
+    %% Create a minimal conn record with low max_header_count
+    Ref = make_ref(),
+    ReqState = #request_state{ref = Ref, method = <<"GET">>},
+    Conn = #gen_http_h1_conn{
+        transport = gen_http_tcp,
+        socket = undefined,
+        host = <<"localhost">>,
+        port = 80,
+        scheme = http,
+        buffer = Buffer,
+        current_request = ReqState,
+        max_header_count = 3
+    },
+
+    %% Parsing should fail with too_many_headers
+    case parse_responses(Conn, []) of
+        {error, _, {protocol_error, too_many_headers}, _} -> ok;
+        Other -> ?assertEqual({error, too_many_headers}, Other)
+    end.
+
+headers_under_limit_test() ->
+    %% 3 headers with limit of 100 should work fine
+    StatusLine = <<"HTTP/1.1 200 OK\r\n">>,
+    Headers = iolist_to_binary([
+        <<"content-length: 0\r\n">>,
+        <<"x-foo: bar\r\n">>,
+        <<"x-baz: qux\r\n">>,
+        <<"\r\n">>
+    ]),
+    Buffer = <<StatusLine/binary, Headers/binary>>,
+    Ref = make_ref(),
+    ReqState = #request_state{ref = Ref, method = <<"GET">>},
+    Conn = #gen_http_h1_conn{
+        transport = gen_http_tcp,
+        socket = undefined,
+        host = <<"localhost">>,
+        port = 80,
+        scheme = http,
+        buffer = Buffer,
+        current_request = ReqState,
+        max_header_count = 100
+    },
+    case parse_responses(Conn, []) of
+        {ok, _, Responses} ->
+            ?assert(
+                lists:any(
+                    fun
+                        ({status, _, 200}) -> true;
+                        (_) -> false
+                    end,
+                    Responses
+                )
+            );
+        Other ->
+            ?assertEqual({ok, parsed}, Other)
+    end.
+
+%%--------------------------------------------------------------------
+%% Chunk Size Overflow Tests
+%%--------------------------------------------------------------------
+
+chunk_size_overflow_hex_too_long_test() ->
+    %% Hex string longer than 16 chars should be rejected
+    Ref = make_ref(),
+    ReqState = #request_state{
+        ref = Ref,
+        method = <<"GET">>,
+        body_state = {chunked, reading_size}
+    },
+    %% 17 hex chars
+    Buffer = <<"FFFFFFFFFFFFFFFFF\r\ndata\r\n">>,
+    Result = parse_chunk_size(Buffer, ReqState, Ref),
+    ?assertMatch({error, {protocol_error, chunk_size_overflow}}, Result).
+
+chunk_size_overflow_value_too_large_test() ->
+    %% Chunk size larger than MAX_CHUNK_SIZE (~2GB) should be rejected
+    Ref = make_ref(),
+    ReqState = #request_state{
+        ref = Ref,
+        method = <<"GET">>,
+        body_state = {chunked, reading_size}
+    },
+    %% 0x80000000 = 2147483648 > MAX_CHUNK_SIZE (2147483647)
+    Buffer = <<"80000000\r\ndata\r\n">>,
+    Result = parse_chunk_size(Buffer, ReqState, Ref),
+    ?assertMatch({error, {protocol_error, chunk_size_overflow}}, Result).
+
+chunk_size_normal_test() ->
+    %% A normal chunk size should parse fine
+    Ref = make_ref(),
+    ReqState = #request_state{
+        ref = Ref,
+        method = <<"GET">>,
+        body_state = {chunked, reading_size}
+    },
+    Buffer = <<"a\r\n0123456789\r\n0\r\n\r\n">>,
+    Result = parse_chunk_size(Buffer, ReqState, Ref),
+    ?assertMatch({done, _, _, _}, Result).
+
+%%--------------------------------------------------------------------
+%% Conflicting Content-Length Tests
+%%--------------------------------------------------------------------
+
+conflicting_content_length_test() ->
+    %% Two Content-Length headers with different values should be rejected
+    Headers = [
+        {<<"content-length">>, <<"100">>},
+        {<<"content-length">>, <<"200">>}
+    ],
+    Result = extract_body_params(Headers, undefined, undefined),
+    ?assertMatch({error, {protocol_error, conflicting_content_length}}, Result).
+
+duplicate_content_length_same_value_test() ->
+    %% Two Content-Length headers with the same value should be accepted (RFC 9110 §8.6)
+    Headers = [
+        {<<"content-length">>, <<"100">>},
+        {<<"content-length">>, <<"100">>}
+    ],
+    Result = extract_body_params(Headers, undefined, undefined),
+    ?assertEqual({content_length, 100}, Result).
+
+%%--------------------------------------------------------------------
+%% Trailer Parsing Tests
+%%--------------------------------------------------------------------
+
+trailers_parsed_correctly_test() ->
+    %% After zero-length chunk, trailer headers should be parsed
+    Ref = make_ref(),
+    ReqState = #request_state{
+        ref = Ref,
+        method = <<"GET">>,
+        body_state = {chunked, reading_size}
+    },
+    Buffer = <<"0\r\ntrailer-key: trailer-val\r\n\r\n">>,
+    Result = parse_chunk_size(Buffer, ReqState, Ref),
+    ?assertMatch({done, [{trailers, Ref, [{<<"trailer-key">>, <<"trailer-val">>}]}, {done, Ref}], _, _}, Result).
+
+no_trailers_test() ->
+    %% Zero-length chunk followed directly by CRLF (no trailers)
+    Ref = make_ref(),
+    ReqState = #request_state{
+        ref = Ref,
+        method = <<"GET">>,
+        body_state = {chunked, reading_size}
+    },
+    Buffer = <<"0\r\n\r\n">>,
+    Result = parse_chunk_size(Buffer, ReqState, Ref),
+    ?assertMatch({done, [{done, Ref}], _, _}, Result).
+
+%%--------------------------------------------------------------------
+%% Close Response Tests
+%%--------------------------------------------------------------------
+
+until_close_generates_done_test() ->
+    Ref = make_ref(),
+    ReqState = #request_state{ref = Ref, method = <<"GET">>, body_state = until_close},
+    Result = generate_close_response(ReqState, []),
+    ?assertEqual([{done, Ref}], Result).
+
+partial_content_length_generates_incomplete_body_test() ->
+    Ref = make_ref(),
+    ReqState = #request_state{
+        ref = Ref,
+        method = <<"GET">>,
+        body_state = {content_length, 1000},
+        bytes_received = 500
+    },
+    Result = generate_close_response(ReqState, []),
+    ?assertMatch([{error, Ref, {application_error, {incomplete_body, 500, 1000}}}], Result).
+
+chunked_close_generates_incomplete_chunked_test() ->
+    Ref = make_ref(),
+    ReqState = #request_state{
+        ref = Ref,
+        method = <<"GET">>,
+        body_state = {chunked, reading_size}
+    },
+    Result = generate_close_response(ReqState, []),
+    ?assertMatch([{error, Ref, {application_error, incomplete_chunked_body}}], Result).
+
+done_state_generates_nothing_test() ->
+    ReqState = #request_state{
+        ref = make_ref(),
+        method = <<"GET">>,
+        body_state = done
+    },
+    Result = generate_close_response(ReqState, []),
+    ?assertEqual([], Result).
+
+%%--------------------------------------------------------------------
+%% is_alive Tests
+%%--------------------------------------------------------------------
+
+is_alive_closed_state_test() ->
+    Conn = #gen_http_h1_conn{
+        transport = gen_http_tcp,
+        socket = undefined,
+        host = <<"localhost">>,
+        port = 80,
+        scheme = http,
+        state = closed
+    },
+    ?assertNot(is_alive(Conn)).
+
+-endif.
