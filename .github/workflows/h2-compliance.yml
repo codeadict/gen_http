@@ -1,7 +1,6 @@
 name: HTTP/2 Compliance
 
 on:
-  pull_request:
   push:
     branches:
       - main
