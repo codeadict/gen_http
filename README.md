@@ -136,19 +136,18 @@ end.
 
 ## Testing
 
-```bash
-# Start test infrastructure
-docker compose -f test/support/docker-compose.yml up -d
+SSL/H2/ALPN tests need `nghttpx` (from nghttp2). Install on macOS with `brew install nghttp2`. Suites that need it skip gracefully if it's not installed.
 
+```bash
 # Run all tests
 rebar3 test
 
 # Run specific test types
-rebar3 eunit           # Unit tests (fast, no docker)
-rebar3 ct              # Integration tests (requires docker)
+rebar3 eunit           # Unit tests
+rebar3 ct              # Integration tests
 rebar3 proper          # Property-based tests
 
-# HTTP/2 compliance tests (excluded by default - slow, requires special setup)
+# HTTP/2 compliance tests (excluded by default, requires separate Docker harness)
 rebar3 ct --suite=h2_compliance_SUITE
 ```
 

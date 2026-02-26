@@ -1,0 +1,3 @@
+# HTTP response fixtures contain protocol-mandated CRLF line endings.
+# Prevent Git from converting them to LF.
+test/data/*.txt binary
