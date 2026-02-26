@@ -18,7 +18,7 @@ jobs:
 
     env:
       OTP_VERSION: '28.1'
-      REBAR3_VERSION: '3.24.0'
+      REBAR3_VERSION: '3.25.0'
 
     steps:
       - name: Checkout
