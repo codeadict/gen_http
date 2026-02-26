@@ -71,7 +71,7 @@ jobs:
         run: rebar3 dialyzer
 
       - name: Install nghttpx
-        run: sudo apt-get update && sudo apt-get install -y nghttp2-tools
+        run: sudo apt-get update && sudo apt-get install -y nghttp2
 
       - name: Run tests
         id: test
