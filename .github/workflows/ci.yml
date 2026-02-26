@@ -27,16 +27,16 @@ jobs:
         include:
           # Latest - run all checks
           - otp: '28.1'
-            rebar3: '3.24.0'
+            rebar3: '3.25.0'
             lint: true
             dialyzer: true
             coverage: true
           # Stable
           - otp: '27.2'
-            rebar3: '3.24.0'
+            rebar3: '3.25.0'
           # Minimum supported
           - otp: '25.3'
-            rebar3: '3.23.0'
+            rebar3: '3.24.0'
 
     steps:
       - name: Checkout
@@ -96,14 +96,14 @@ jobs:
 
       - name: Generate coverage report
         if: ${{ matrix.coverage }}
-        run: rebar3 covertool generate
+        run: rebar3 as test codecov analyze
 
       - name: Upload coverage to Codecov
         if: ${{ matrix.coverage }}
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5.5.2
         with:
-          files: _build/test/covertool/gen_http.covertool.xml
-          fail_ci_if_error: false
+          files: _build/test/codecov/codecov.json
+          fail_ci_if_error: true
           flags: erlang-${{ matrix.otp }}
           name: Erlang/OTP ${{ matrix.otp }}
           verbose: true # optional (default = false)
