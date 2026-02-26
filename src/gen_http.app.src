@@ -1,8 +1,9 @@
 {application, gen_http, [
     {description, "Erlang native HTTP client with support for HTTP/1 and HTTP/2."},
-    {vsn, git},
-    {applications, [kernel, stdlib, crypto, asn1, public_key, ssl]},
+    {vsn, {cmd, "cat VERSION"}},
+    {applications, [kernel, stdlib, crypto, public_key, ssl]},
     {registered, []},
+    {modules, []},
     {licenses, ["Apache-2.0"]},
     {maintainers, ["Dairon Medina Caro <me@dairon.org>"]},
     {links, [{"GitHub", "https://github.com/codeadict/gen_http"}]},
