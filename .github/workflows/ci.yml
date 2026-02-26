@@ -70,18 +70,8 @@ jobs:
         if: ${{ matrix.dialyzer }}
         run: rebar3 dialyzer
 
-      - name: Clean test volumes
-        run: |
-          # Remove any leftover Docker volumes that may cause permission issues
-          rm -rf .caddy_storage test/support/caddy_storage || true
-
-      - name: Start docker services
-        run: docker compose -f test/support/docker-compose.yml up -d
-
-      - name: Wait for services
-        run: |
-          timeout 30 sh -c 'until curl -s http://localhost:8080/get > /dev/null; do sleep 1; done'
-          timeout 30 sh -c 'until curl -k -s https://localhost:8443/get > /dev/null; do sleep 1; done'
+      - name: Install nghttpx
+        run: sudo apt-get update && sudo apt-get install -y nghttp2-tools
 
       - name: Run EUnit tests
         run: rebar3 eunit --cover
@@ -112,6 +102,3 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Stop docker services
-        if: always()
-        run: docker compose -f test/support/docker-compose.yml down
