@@ -13,10 +13,10 @@
 ]).
 
 -export([
-    % Google.com tests (real HTTP/2 server)
-    google_get/1,
-    google_multiplexing/1,
-    google_connection_reuse/1,
+    % H2 tests through nghttpx
+    h2_simple_get/1,
+    h2_multiplexing/1,
+    h2_connection_reuse/1,
 
     % Local HTTPS tests
     local_https_post/1,
@@ -32,17 +32,17 @@
 
 all() ->
     [
-        {group, google_tests},
+        {group, h2_tests},
         {group, local_https_tests},
         {group, informational_responses}
     ].
 
 groups() ->
     [
-        {google_tests, [sequence], [
-            google_get,
-            google_multiplexing,
-            google_connection_reuse
+        {h2_tests, [sequence], [
+            h2_simple_get,
+            h2_multiplexing,
+            h2_connection_reuse
         ]},
         {local_https_tests, [parallel], [
             local_https_post,
@@ -54,29 +54,26 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Check if docker-compose services are available for local tests
-    case test_helper:is_server_available() of
-        true ->
-            ct:pal("Docker services are available"),
-            [{server_available, true} | Config];
-        false ->
-            ct:pal("Docker services not available (local tests will be skipped)"),
-            [{server_available, false} | Config]
+    {ok, MockPid, MockPort} = test_helper:start_mock(),
+    case test_helper:start_nghttpx(MockPort) of
+        {ok, NghttpxInfo} ->
+            [
+                {mock_pid, MockPid},
+                {http_port, MockPort},
+                {https_port, maps:get(port, NghttpxInfo)},
+                {nghttpx_info, NghttpxInfo}
+                | Config
+            ];
+        {skip, _} = Skip ->
+            test_helper:stop_mock(MockPid),
+            Skip
     end.
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    test_helper:stop_nghttpx(?config(nghttpx_info, Config)),
+    test_helper:stop_mock(?config(mock_pid, Config)),
     ok.
 
-init_per_testcase(TestCase, Config) when
-    TestCase =:= local_https_post;
-    TestCase =:= local_https_streaming_post
-->
-    case proplists:get_value(server_available, Config) of
-        true ->
-            Config;
-        false ->
-            {skip, "Docker services not available. Run: docker compose -f test/support/docker-compose.yml up -d"}
-    end;
 init_per_testcase(_TestCase, Config) ->
     Config.
 
@@ -84,45 +81,46 @@ end_per_testcase(_TestCase, _Config) ->
     ok.
 
 %%====================================================================
-%% Google.com Tests (Real HTTP/2 Server)
+%% H2 Tests (through nghttpx)
 %%====================================================================
 
-google_get(_Config) ->
-    ct:pal("Testing HTTP/2 GET request to google.com"),
-    {ok, Conn} = gen_http_h2:connect(https, "google.com", 443),
+h2_simple_get(Config) ->
+    ct:pal("Testing HTTP/2 GET request"),
+    Port = ?config(https_port, Config),
+    Opts = #{transport_opts => [{verify, verify_none}]},
+    {ok, Conn} = gen_http_h2:connect(https, <<"127.0.0.1">>, Port, Opts),
     ?assert(gen_http_h2:is_open(Conn)),
 
     Headers = [{<<"user-agent">>, <<"gen_http_test/1.0">>}],
-    {ok, Conn2, Ref, StreamId} = gen_http_h2:request(Conn, <<"GET">>, <<"/">>, Headers, <<>>),
+    {ok, Conn2, Ref, StreamId} = gen_http_h2:request(Conn, <<"GET">>, <<"/get">>, Headers, <<>>),
 
-    %% Collect response
-    {Conn2Updated, Response} = collect_response(Conn2, Ref, StreamId, #{}, 5000),
+    {Conn3, Response} = collect_response(Conn2, Ref, StreamId, #{}, 5000),
     ?assert(maps:is_key(headers, Response)),
     ?assert(maps:is_key(body, Response)),
 
-    %% Verify we got HTML content
     Body = maps:get(body, Response),
     ?assert(byte_size(Body) > 0),
 
-    {ok, _} = gen_http_h2:close(Conn2Updated),
+    {ok, _} = gen_http_h2:close(Conn3),
     ok.
 
-google_multiplexing(_Config) ->
-    ct:pal("Testing HTTP/2 stream multiplexing with google.com"),
-    {ok, Conn} = gen_http_h2:connect(https, "google.com", 443),
+h2_multiplexing(Config) ->
+    ct:pal("Testing HTTP/2 stream multiplexing"),
+    Port = ?config(https_port, Config),
+    Opts = #{transport_opts => [{verify, verify_none}]},
+    {ok, Conn} = gen_http_h2:connect(https, <<"127.0.0.1">>, Port, Opts),
 
     Headers = [{<<"user-agent">>, <<"gen_http_test/1.0">>}],
 
     %% Send 3 concurrent requests
-    {ok, Conn2, Ref1, StreamId1} = gen_http_h2:request(Conn, <<"GET">>, <<"/">>, Headers, <<>>),
-    {ok, Conn3, Ref2, StreamId2} = gen_http_h2:request(Conn2, <<"GET">>, <<"/">>, Headers, <<>>),
-    {ok, Conn4, Ref3, StreamId3} = gen_http_h2:request(Conn3, <<"GET">>, <<"/">>, Headers, <<>>),
+    {ok, Conn2, Ref1, StreamId1} = gen_http_h2:request(Conn, <<"GET">>, <<"/get">>, Headers, <<>>),
+    {ok, Conn3, Ref2, StreamId2} = gen_http_h2:request(Conn2, <<"GET">>, <<"/get">>, Headers, <<>>),
+    {ok, Conn4, Ref3, StreamId3} = gen_http_h2:request(Conn3, <<"GET">>, <<"/get">>, Headers, <<>>),
 
     %% Collect all responses
     Refs = [{Ref1, StreamId1}, {Ref2, StreamId2}, {Ref3, StreamId3}],
     {Conn5, Responses} = collect_all_responses(Conn4, Refs, #{}, 10000),
 
-    %% Verify all responses received
     Resp1 = maps:get(Ref1, Responses),
     Resp2 = maps:get(Ref2, Responses),
     Resp3 = maps:get(Ref3, Responses),
@@ -138,42 +136,42 @@ google_multiplexing(_Config) ->
     {ok, _} = gen_http_h2:close(Conn5),
     ok.
 
-google_connection_reuse(_Config) ->
+h2_connection_reuse(Config) ->
     ct:pal("Testing HTTP/2 connection reuse"),
-    {ok, Conn} = gen_http_h2:connect(https, "google.com", 443),
+    Port = ?config(https_port, Config),
+    Opts = #{transport_opts => [{verify, verify_none}]},
+    {ok, Conn} = gen_http_h2:connect(https, <<"127.0.0.1">>, Port, Opts),
     Socket1 = gen_http_h2:get_socket(Conn),
 
     Headers = [{<<"user-agent">>, <<"gen_http_test/1.0">>}],
 
     %% First request
-    {ok, Conn2, Ref1, StreamId1} = gen_http_h2:request(Conn, <<"GET">>, <<"/">>, Headers, <<>>),
-    {Conn2Updated, Response1} = collect_response(Conn2, Ref1, StreamId1, #{}, 5000),
+    {ok, Conn2, Ref1, StreamId1} = gen_http_h2:request(Conn, <<"GET">>, <<"/get">>, Headers, <<>>),
+    {Conn3, Response1} = collect_response(Conn2, Ref1, StreamId1, #{}, 5000),
     ?assert(maps:get(done, Response1, false)),
 
-    %% Second request - should reuse same socket (different stream)
-    {ok, Conn3, Ref2, StreamId2} = gen_http_h2:request(Conn2Updated, <<"GET">>, <<"/">>, Headers, <<>>),
-    Socket2 = gen_http_h2:get_socket(Conn3),
+    %% Second request — same socket, different stream
+    {ok, Conn4, Ref2, StreamId2} = gen_http_h2:request(Conn3, <<"GET">>, <<"/get">>, Headers, <<>>),
+    Socket2 = gen_http_h2:get_socket(Conn4),
 
-    %% Same socket = connection reused
     ?assertEqual(Socket1, Socket2),
-    %% Different stream IDs
     ?assertNotEqual(StreamId1, StreamId2),
 
-    {Conn3Updated, Response2} = collect_response(Conn3, Ref2, StreamId2, #{}, 5000),
+    {Conn5, Response2} = collect_response(Conn4, Ref2, StreamId2, #{}, 5000),
     ?assert(maps:get(done, Response2, false)),
 
-    {ok, _} = gen_http_h2:close(Conn3Updated),
+    {ok, _} = gen_http_h2:close(Conn5),
     ok.
 
 %%====================================================================
 %% Local HTTPS Tests
 %%====================================================================
 
-local_https_post(_Config) ->
+local_https_post(Config) ->
     ct:pal("Testing HTTP/2 POST to local HTTPS server"),
-    {https, Host, Port} = test_helper:https_server(),
+    Port = ?config(https_port, Config),
     Opts = #{transport_opts => [{verify, verify_none}]},
-    {ok, Conn} = gen_http_h2:connect(https, list_to_binary(Host), Port, Opts),
+    {ok, Conn} = gen_http_h2:connect(https, <<"127.0.0.1">>, Port, Opts),
 
     Headers = [
         {<<"content-type">>, <<"application/json">>},
@@ -183,22 +181,20 @@ local_https_post(_Config) ->
 
     {ok, Conn2, Ref, StreamId} = gen_http_h2:request(Conn, <<"POST">>, <<"/post">>, Headers, Body),
 
-    %% Collect response
-    {Conn2Updated, Response} = collect_response(Conn2, Ref, StreamId, #{}, 5000),
+    {Conn3, Response} = collect_response(Conn2, Ref, StreamId, #{}, 5000),
     ?assert(maps:is_key(headers, Response)),
 
-    %% Verify posted data is echoed back
     ResponseBody = maps:get(body, Response, <<>>),
     ?assert(binary:match(ResponseBody, <<"test">>) =/= nomatch),
 
-    {ok, _} = gen_http_h2:close(Conn2Updated),
+    {ok, _} = gen_http_h2:close(Conn3),
     ok.
 
-local_https_streaming_post(_Config) ->
+local_https_streaming_post(Config) ->
     ct:pal("Testing HTTP/2 streaming POST to local HTTPS server"),
-    {https, Host, Port} = test_helper:https_server(),
+    Port = ?config(https_port, Config),
     Opts = #{transport_opts => [{verify, verify_none}]},
-    {ok, Conn} = gen_http_h2:connect(https, list_to_binary(Host), Port, Opts),
+    {ok, Conn} = gen_http_h2:connect(https, <<"127.0.0.1">>, Port, Opts),
 
     Headers = [
         {<<"content-type">>, <<"text/plain">>},
@@ -216,17 +212,15 @@ local_https_streaming_post(_Config) ->
     %% End streaming
     {ok, Conn6} = gen_http_h2:stream_request_body(Conn5, StreamId, eof),
 
-    %% Collect response
-    {Conn6Updated, Response} = collect_response(Conn6, Ref, StreamId, #{}, 5000),
+    {Conn7, Response} = collect_response(Conn6, Ref, StreamId, #{}, 5000),
     ?assert(maps:is_key(body, Response)),
 
-    %% Verify chunks are in response
     ResponseBody = maps:get(body, Response),
     ?assert(binary:match(ResponseBody, <<"First chunk">>) =/= nomatch),
     ?assert(binary:match(ResponseBody, <<"Second chunk">>) =/= nomatch),
     ?assert(binary:match(ResponseBody, <<"Third chunk">>) =/= nomatch),
 
-    {ok, _} = gen_http_h2:close(Conn6Updated),
+    {ok, _} = gen_http_h2:close(Conn7),
     ok.
 
 %%====================================================================
@@ -324,26 +318,12 @@ process_responses([{done, Ref, StreamId} | Rest], Ref, StreamId, Acc) ->
 process_responses([{error, Ref, StreamId, Reason} | Rest], Ref, StreamId, Acc) ->
     process_responses(Rest, Ref, StreamId, Acc#{error => Reason});
 process_responses([_ | Rest], Ref, StreamId, Acc) ->
-    %% Ignore responses for other requests
     process_responses(Rest, Ref, StreamId, Acc).
 
 %%====================================================================
 %% Informational Responses (1xx)
 %%====================================================================
 
-%% @doc Test 103 Early Hints informational response for HTTP/2
-%% HTTP/2 1xx responses are emitted as multiple HEADERS frames without END_STREAM flag.
-%% The implementation extracts :status and handles multiple interim responses before the final one.
 informational_103_early_hints(_Config) ->
     ct:pal("Testing 103 Early Hints (validated via implementation correctness)"),
-
-    %% HTTP/2 1xx support is validated through:
-    %% 1. gen_http_h2:emit_header_events/7 correctly detects 1xx via :status pseudo-header
-    %% 2. Multiple HEADERS frames are processed without storing in stream state
-    %% 3. Real-world validation confirmed against production servers
-    %%
-    %% Testing 1xx in HTTP/2 requires complex frame-level mocking (HPACK encoding,
-    %% HEADERS frames with/without END_STREAM flags). The critical logic is already
-    %% tested via HTTP/1.1 (same state machine) and production server validation.
-
     ok.

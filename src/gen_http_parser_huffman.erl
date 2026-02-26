@@ -1196,9 +1196,26 @@ decode_invalid_test() ->
     Result = gen_http_parser_huffman:decode(InvalidData),
     ?assertMatch({error, _}, Result).
 
-high_bit_characters_test() ->
-    Data = <<200, 201, 202>>,
+all_byte_values_roundtrip_test() ->
+    Data = list_to_binary(lists:seq(0, 255)),
     Encoded = gen_http_parser_huffman:encode(Data),
     ?assertMatch({ok, Data}, gen_http_parser_huffman:decode(Encoded)).
+
+decode_invalid_padding_test() ->
+    %% Padding that isn't all 1-bits should produce an error.
+    %% Encode "a" (5-bit code 0x3), then corrupt the 3-bit padding.
+    GoodEncoded = gen_http_parser_huffman:encode(<<"a">>),
+    %% "a" encodes to 5 bits (00011) padded with 111 -> 00011111 = 0x1F
+    ?assertEqual(<<16#1F>>, GoodEncoded),
+    %% Replace padding with zeros: 00011000 = 0x18
+    BadPadding = <<16#18>>,
+    ?assertMatch({error, {huffman_decode_error, _}}, gen_http_parser_huffman:decode(BadPadding)).
+
+decode_invalid_code_test() ->
+    %% The EOS symbol (all 1s, 30 bits) should not decode as valid data.
+    %% 30 bits of 1s padded to 32 bits = 0xFFFFFFFC
+    EosEncoded = <<16#FF, 16#FF, 16#FF, 16#FC>>,
+    Result = gen_http_parser_huffman:decode(EosEncoded),
+    ?assertMatch({error, _}, Result).
 
 -endif.

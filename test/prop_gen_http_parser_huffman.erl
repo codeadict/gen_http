@@ -67,6 +67,27 @@ prop_huffman_empty_input() ->
     ).
 
 %% -------------------------------------------------------------------
+%% Full Byte Range Round-trip Property
+%% -------------------------------------------------------------------
+
+prop_huffman_full_byte_range_roundtrip() ->
+    ?FORALL(
+        Input,
+        any_binary(),
+        begin
+            Encoded = gen_http_parser_huffman:encode(Input),
+            Padded = pad_to_byte_boundary(Encoded),
+            case gen_http_parser_huffman:decode(Padded) of
+                {ok, Decoded} ->
+                    ?assertEqual(Input, Decoded),
+                    true;
+                {error, _Reason} ->
+                    false
+            end
+        end
+    ).
+
+%% -------------------------------------------------------------------
 %% Generators
 %% -------------------------------------------------------------------
 
@@ -83,6 +104,14 @@ printable_char() ->
     %% HTTP header field values are typically printable ASCII (32-126)
     %% plus some common extended ASCII
     oneof(lists:seq(32, 126) ++ [9, 10, 13]).
+
+-spec any_binary() -> proper_types:type().
+any_binary() ->
+    ?LET(
+        Bytes,
+        list(range(0, 255)),
+        list_to_binary(Bytes)
+    ).
 
 %% -------------------------------------------------------------------
 %% Helpers

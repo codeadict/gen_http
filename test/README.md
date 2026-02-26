@@ -4,118 +4,83 @@ This directory contains tests for the gen_http HTTP client library.
 
 ## Test Infrastructure
 
-Tests run against local Docker containers instead of hitting external websites. This means tests won't randomly fail from network issues, they run faster, and you're not leaking requests during development.
+Tests run against local servers with zero outgoing network requests:
 
-### Test Server Setup
+- **mock_server** (Erlang): HTTP/1.1 echo server that parses requests, routes by path, and echoes back JSON. Started in-process via `mock_server:start_http/0`.
+- **nghttpx**: TLS/H2 reverse proxy that terminates TLS and speaks HTTP/2 to clients, forwarding to the mock server over plain TCP.
 
-The test infrastructure uses:
-
-- **httpbin**: HTTP testing service (provides /get, /post, /status/*, etc.)
-- **Caddy**: Reverse proxy providing HTTPS with self-signed certificates
-
-## Running Tests
-
-### 1. Start Test Infrastructure
-
-```bash
-# Start the test servers
-docker compose -f test/support/docker-compose.yml up -d
-
-# Check servers are healthy
-docker compose -f test/support/docker-compose.yml ps
-
-# View logs if needed
-docker compose -f test/support/docker-compose.yml logs -f
+```
+HTTP/1.1 tests ──→ mock_server (port A, plain TCP)
+                         ↑
+                         │ backend
+HTTPS/H2 tests ──→ nghttpx (port B, TLS+ALPN) ───┘
 ```
 
-### 2. Run Tests
+## Requirements
+
+- Erlang/OTP 27+
+- `nghttpx` (from nghttp2) for SSL/H2/ALPN tests
+- `openssl` for generating self-signed certificates
+
+Install nghttpx on macOS:
+
+```bash
+brew install nghttp2
+```
+
+## Running Tests
 
 ```bash
 # Run all unit tests
 rebar3 eunit
 
-# Run Common Test integration tests (requires docker servers)
+# Run all Common Test integration tests
 rebar3 ct
+
+# Run a specific suite
+rebar3 ct --suite=http1_SUITE
+rebar3 ct --suite=ssl_SUITE
+rebar3 ct --suite=http2_SUITE
+rebar3 ct --suite=unified_SUITE
+rebar3 ct --suite=features_SUITE
 
 # Run property-based tests
 rebar3 proper
 
-# Run all tests
-rebar3 test
-
-# Run HTTP/2 compliance tests (excluded by default - slow, requires special setup)
-# Note: This requires the h2-test-harness-patched Docker image to be built
+# Run HTTP/2 compliance tests (excluded by default, requires separate Docker harness)
 rebar3 ct --suite=h2_compliance_SUITE
 ```
 
-### 3. Stop Test Infrastructure
-
-```bash
-# Stop and remove containers
-docker compose -f test/support/docker-compose.yml down
-
-# Stop and remove containers + volumes
-docker compose -f test/support/docker-compose.yml down -v
-```
+Suites that need nghttpx skip gracefully if it's not installed.
 
 ## Test Server Endpoints
 
-httpbin gives you these endpoints:
+The mock server handles these routes:
 
-- `GET /get` - Returns GET request data
-- `POST /post` - Returns POST request data
-- `GET /status/{code}` - Returns specified HTTP status code
-- `GET /delay/{seconds}` - Delays response
-- `GET /redirect/{n}` - 302 redirect n times
-- `POST /anything` - Returns anything sent
-- Plus more at [httpbin.org](https://httpbin.org/)
-
-## Configuration
-
-Change ports with environment variables:
-
-- `HTTPBIN_HTTP_PORT` (default: 8080) - HTTP server port
-- `HTTPBIN_HTTPS_PORT` (default: 8443) - HTTPS server port
-
-Create a `.env` file in the project root:
-
-```bash
-HTTPBIN_HTTP_PORT=8080
-HTTPBIN_HTTPS_PORT=8443
-```
-
-## Troubleshooting
-
-### Tests are skipped
-
-If tests are being skipped with "Test server not available", ensure:
-
-1. Docker Compose is running: `docker compose -f test/support/docker-compose.yml ps`
-2. Services are healthy: `docker compose -f test/support/docker-compose.yml ps` (should show "healthy")
-3. Ports are accessible: `curl http://localhost:8080/get`
-
-### Port conflicts
-
-If ports 8080 or 8443 are already in use, either stop whatever's using them or change the ports in `.env` and restart docker compose.
-
-### SSL certificate errors
-
-Caddy uses self-signed certificates for local testing. Use `verify_none` in your tests:
-
-```erlang
-{ok, Conn} = gen_http:connect(https, "localhost", 8443, #{
-    transport_opts => [{verify, verify_none}]
-}).
-```
+| Path | Behavior |
+|------|----------|
+| `GET /get` | 200, JSON echo of method/path/args/headers |
+| `POST /post` | 200, JSON echo including posted body |
+| `GET /status/<code>` | Responds with `<code>` status |
+| `GET /redirect/<n>` | 302 redirect chain down to `/get` |
+| `GET /bytes/<n>` | 200 with n zero-bytes |
+| `GET /stream-bytes/<n>` | 200, chunked transfer, n bytes total |
+| `GET /response-headers?K=V` | 200 with K:V as response headers |
+| `GET /delay/<n>` | Sleeps n seconds, then 200 |
+| fallback | 200, empty body |
 
 ## Test Structure
 
-- `test_helper.erl` - Common test utilities and server configuration
-- `*_SUITE.erl` - Common Test suites (integration tests)
-  - `features_SUITE.erl` - Feature tests
-  - `http1_SUITE.erl` - HTTP/1.1 protocol tests
-  - `http2_SUITE.erl` - HTTP/2 protocol tests
-  - `ssl_SUITE.erl` - SSL/TLS tests
-  - `unified_SUITE.erl` - Unified API tests
-  - `h2_compliance_SUITE.erl` - HTTP/2 RFC compliance (excluded by default)
+- `mock_server.erl` - Two-mode mock: canned-response replay + HTTP echo server
+- `test_helper.erl` - Common utilities: nghttpx lifecycle, cert generation, response collection
+- `test/data/` - Canned HTTP response fixtures for protocol hardening tests
+- `*_SUITE.erl` - Common Test suites:
+  - `http1_SUITE.erl` - HTTP/1.1 protocol tests (mock_server only)
+  - `ssl_SUITE.erl` - SSL/TLS and ALPN tests (mock_server + nghttpx)
+  - `http2_SUITE.erl` - HTTP/2 protocol tests (nghttpx)
+  - `unified_SUITE.erl` - Unified API tests (mock_server + nghttpx)
+  - `features_SUITE.erl` - Feature tests: recv, set_mode, controlling_process, put_log (nghttpx)
+  - `protocol_hardening_SUITE.erl` - Protocol limits and error detection (mock_server canned mode)
+  - `error_path_SUITE.erl` - Error path coverage
+  - `h2_compliance_SUITE.erl` - HTTP/2 RFC compliance (separate Docker harness, excluded by default)
 - `prop_*.erl` - Property-based tests using PropEr

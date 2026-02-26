@@ -1522,3 +1522,73 @@ generate_error_responses(Streams, Reason) ->
         [],
         Streams
     ).
+
+%%====================================================================
+%% Unit Tests
+%%====================================================================
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+format_authority_default_ports_test() ->
+    ?assertEqual(<<"example.com">>, format_authority(<<"example.com">>, 80)),
+    ?assertEqual(<<"example.com">>, format_authority(<<"example.com">>, 443)).
+
+format_authority_custom_port_test() ->
+    ?assertEqual(<<"example.com:8080">>, format_authority(<<"example.com">>, 8080)).
+
+validate_opts_valid_test() ->
+    ?assertEqual(ok, validate_opts(#{})),
+    ?assertEqual(ok, validate_opts(#{timeout => 5000, mode => active})).
+
+validate_opts_unknown_test() ->
+    ?assertMatch({error, {unknown_option, _}}, validate_opts(#{bogus => true})).
+
+ensure_binary_test() ->
+    ?assertEqual(<<"hello">>, ensure_binary(<<"hello">>)),
+    ?assertEqual(<<"hello">>, ensure_binary("hello")),
+    ?assertEqual(<<"hello">>, ensure_binary(hello)).
+
+has_alpn_option_test() ->
+    ?assertEqual(false, has_alpn_option([])),
+    ?assertEqual(true, has_alpn_option([{alpn_advertise, [<<"h2">>]}])),
+    ?assertEqual(true, has_alpn_option([{alpn_advertised_protocols, [<<"h2">>]}])).
+
+is_informational_status_test() ->
+    ?assert(is_informational_status(100)),
+    ?assert(is_informational_status(103)),
+    ?assert(is_informational_status(199)),
+    ?assertNot(is_informational_status(200)),
+    ?assertNot(is_informational_status(99)).
+
+extract_status_test() ->
+    ?assertEqual(
+        {ok, 200},
+        extract_status([{<<":status">>, <<"200">>}, {<<"content-type">>, <<"text/html">>}])
+    ),
+    ?assertEqual({error, missing_status}, extract_status([{<<"content-type">>, <<"text/html">>}])).
+
+remove_pseudo_headers_test() ->
+    Headers = [
+        {<<":status">>, <<"200">>},
+        {<<":method">>, <<"GET">>},
+        {<<"content-type">>, <<"text/html">>},
+        {<<"server">>, <<"nginx">>}
+    ],
+    ?assertEqual(
+        [{<<"content-type">>, <<"text/html">>}, {<<"server">>, <<"nginx">>}],
+        remove_pseudo_headers(Headers)
+    ).
+
+remove_pseudo_headers_except_status_test() ->
+    Headers = [
+        {<<":status">>, <<"200">>},
+        {<<":method">>, <<"GET">>},
+        {<<"content-type">>, <<"text/html">>}
+    ],
+    ?assertEqual(
+        [{<<":status">>, <<"200">>}, {<<"content-type">>, <<"text/html">>}],
+        remove_pseudo_headers_except_status(Headers)
+    ).
+
+-endif.

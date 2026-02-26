@@ -92,16 +92,24 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Check if docker-compose services are available
-    case test_helper:is_server_available() of
-        true ->
-            ct:pal("Docker services are available"),
-            Config;
-        false ->
-            {skip, "Docker services not available. Run: docker compose -f test/support/docker-compose.yml up -d"}
+    {ok, MockPid, MockPort} = test_helper:start_mock(),
+    case test_helper:start_nghttpx(MockPort) of
+        {ok, NghttpxInfo} ->
+            [
+                {mock_pid, MockPid},
+                {http_port, MockPort},
+                {https_port, maps:get(port, NghttpxInfo)},
+                {nghttpx_info, NghttpxInfo}
+                | Config
+            ];
+        {skip, _} = Skip ->
+            test_helper:stop_mock(MockPid),
+            Skip
     end.
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    test_helper:stop_nghttpx(?config(nghttpx_info, Config)),
+    test_helper:stop_mock(?config(mock_pid, Config)),
     ok.
 
 init_per_testcase(_TestCase, Config) ->
@@ -114,35 +122,35 @@ end_per_testcase(_TestCase, _Config) ->
 %% Unified Connect Tests
 %%====================================================================
 
-unified_connect_http(_Config) ->
+unified_connect_http(Config) ->
     ct:pal("Testing unified HTTP connection"),
-    {http, Host, Port} = test_helper:http_server(),
-    Result = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    Result = gen_http:connect(http, <<"127.0.0.1">>, Port),
     ?assertMatch({ok, _Conn}, Result),
     {ok, Conn} = Result,
     ?assert(gen_http:is_open(Conn)),
     {ok, _} = gen_http:close(Conn),
     ok.
 
-unified_connect_https(_Config) ->
+unified_connect_https(Config) ->
     ct:pal("Testing unified HTTPS connection"),
-    {https, Host, Port} = test_helper:https_server(),
+    Port = ?config(https_port, Config),
     Opts = #{transport_opts => [{verify, verify_none}]},
-    Result = gen_http:connect(https, list_to_binary(Host), Port, Opts),
+    Result = gen_http:connect(https, <<"127.0.0.1">>, Port, Opts),
     ?assertMatch({ok, _Conn}, Result),
     {ok, Conn} = Result,
     ?assert(gen_http:is_open(Conn)),
     {ok, _} = gen_http:close(Conn),
     ok.
 
-unified_connect_with_options(_Config) ->
+unified_connect_with_options(Config) ->
     ct:pal("Testing unified connection with custom options"),
-    {http, Host, Port} = test_helper:http_server(),
+    Port = ?config(http_port, Config),
     Opts = #{
         timeout => 10000,
         max_pipeline => 5
     },
-    Result = gen_http:connect(http, list_to_binary(Host), Port, Opts),
+    Result = gen_http:connect(http, <<"127.0.0.1">>, Port, Opts),
     ?assertMatch({ok, _Conn}, Result),
     {ok, Conn} = Result,
     {ok, _} = gen_http:close(Conn),
@@ -152,23 +160,19 @@ unified_connect_with_options(_Config) ->
 %% Request with Passive Mode Recv Tests
 %%====================================================================
 
-passive_mode_simple_get(_Config) ->
+passive_mode_simple_get(Config) ->
     ct:pal("Testing passive mode simple GET request"),
-    {http, Host, Port} = test_helper:http_server(),
-    case gen_http:connect(http, list_to_binary(Host), Port, #{mode => passive, protocols => [http1]}) of
+    Port = ?config(http_port, Config),
+    case gen_http:connect(http, <<"127.0.0.1">>, Port, #{mode => passive, protocols => [http1]}) of
         {error, _} ->
-            %% Server unavailable, skip test
             ok;
         {ok, Conn} ->
-            %% Send request
             case gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>) of
                 {ok, Conn2, Ref} ->
-                    %% Receive response using recv/3
                     Result = gen_http:recv(Conn2, 0, 5000),
 
                     case Result of
                         {ok, Conn3, Responses} ->
-                            %% Verify we got status response
                             HasStatus = lists:any(
                                 fun
                                     ({status, R, Status}) when R =:= Ref ->
@@ -181,36 +185,29 @@ passive_mode_simple_get(_Config) ->
                             ?assert(HasStatus),
                             {ok, _} = gen_http:close(Conn3);
                         {error, Conn3, _Reason, _Responses} ->
-                            %% Connection closed with responses, skip test
                             {ok, _} = gen_http:close(Conn3);
                         {error, Conn3, _Reason} ->
-                            %% Request failed, close and skip
                             {ok, _} = gen_http:close(Conn3)
                     end;
                 {error, ConnErr, _Reason} ->
-                    %% Request failed (connection closed), skip test
                     {ok, _} = gen_http:close(ConnErr)
             end
     end,
     ok.
 
-passive_mode_with_timeout(_Config) ->
+passive_mode_with_timeout(Config) ->
     ct:pal("Testing passive mode with timeout"),
-    {http, Host, Port} = test_helper:http_server(),
-    case gen_http:connect(http, list_to_binary(Host), Port, #{mode => passive, protocols => [http1]}) of
+    Port = ?config(http_port, Config),
+    case gen_http:connect(http, <<"127.0.0.1">>, Port, #{mode => passive, protocols => [http1]}) of
         {error, _} ->
-            %% Server unavailable, skip test
             ok;
         {ok, Conn} ->
-            %% Send request
             case gen_http:request(Conn, <<"GET">>, <<"/delay/1">>, [], <<>>) of
                 {ok, Conn2, Ref} ->
-                    %% Receive with timeout
                     Result = gen_http:recv(Conn2, 0, 10000),
 
                     case Result of
                         {ok, Conn3, Responses} ->
-                            %% Check for status 200
                             HasStatus200 = lists:any(
                                 fun
                                     ({status, R, 200}) when R =:= Ref -> true;
@@ -221,24 +218,21 @@ passive_mode_with_timeout(_Config) ->
                             ?assert(HasStatus200),
                             {ok, _} = gen_http:close(Conn3);
                         {error, Conn3, _Reason, _Responses} ->
-                            %% Connection closed with responses, skip test
                             {ok, _} = gen_http:close(Conn3);
                         {error, Conn3, _Reason} ->
                             {ok, _} = gen_http:close(Conn3)
                     end;
                 {error, ConnErr, _Reason} ->
-                    %% Request failed (connection closed), skip test
                     {ok, _} = gen_http:close(ConnErr)
             end
     end,
     ok.
 
-passive_mode_post_with_body(_Config) ->
+passive_mode_post_with_body(Config) ->
     ct:pal("Testing passive mode POST with body"),
-    {http, Host, Port} = test_helper:http_server(),
-    case gen_http:connect(http, list_to_binary(Host), Port, #{mode => passive, protocols => [http1]}) of
+    Port = ?config(http_port, Config),
+    case gen_http:connect(http, <<"127.0.0.1">>, Port, #{mode => passive, protocols => [http1]}) of
         {error, _} ->
-            %% Server unavailable, skip test
             ok;
         {ok, Conn} ->
             Headers = [
@@ -246,15 +240,12 @@ passive_mode_post_with_body(_Config) ->
             ],
             Body = <<"{\"test\": \"data\"}">>,
 
-            %% Send request
             case gen_http:request(Conn, <<"POST">>, <<"/post">>, Headers, Body) of
                 {ok, Conn2, Ref} ->
-                    %% Receive response
                     Result = gen_http:recv(Conn2, 0, 5000),
 
                     case Result of
                         {ok, Conn3, Responses} ->
-                            %% Check for status 200
                             HasStatus200 = lists:any(
                                 fun
                                     ({status, R, 200}) when R =:= Ref -> true;
@@ -265,13 +256,11 @@ passive_mode_post_with_body(_Config) ->
                             ?assert(HasStatus200),
                             {ok, _} = gen_http:close(Conn3);
                         {error, Conn3, _Reason, _Responses} ->
-                            %% Connection closed with responses, skip test
                             {ok, _} = gen_http:close(Conn3);
                         {error, Conn3, _Reason} ->
                             {ok, _} = gen_http:close(Conn3)
                     end;
                 {error, ConnErr, _Reason} ->
-                    %% Request failed (connection closed), skip test
                     {ok, _} = gen_http:close(ConnErr)
             end
     end,
@@ -281,10 +270,10 @@ passive_mode_post_with_body(_Config) ->
 %% Unified Request Tests (Non-blocking)
 %%====================================================================
 
-unified_request(_Config) ->
+unified_request(Config) ->
     ct:pal("Testing unified request function"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Conn} = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    {ok, Conn} = gen_http:connect(http, <<"127.0.0.1">>, Port),
 
     Result = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
     case Result of
@@ -292,7 +281,6 @@ unified_request(_Config) ->
             ?assert(is_reference(Ref)),
             {ok, _} = gen_http:close(Conn2);
         {ok, Conn2, Ref, _StreamId} ->
-            %% HTTP/2 returns StreamId too
             ?assert(is_reference(Ref)),
             {ok, _} = gen_http:close(Conn2);
         {error, Conn2, _Reason} ->
@@ -304,10 +292,10 @@ unified_request(_Config) ->
 %% Unified Stream Tests
 %%====================================================================
 
-unified_stream_unknown_message(_Config) ->
+unified_stream_unknown_message(Config) ->
     ct:pal("Testing unified stream with unknown message"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Conn} = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    {ok, Conn} = gen_http:connect(http, <<"127.0.0.1">>, Port),
 
     UnknownMsg = {unknown, message},
     Result = gen_http:stream(Conn, UnknownMsg),
@@ -320,54 +308,47 @@ unified_stream_unknown_message(_Config) ->
 %% Unified Metadata Tests
 %%====================================================================
 
-unified_put_private(_Config) ->
+unified_put_private(Config) ->
     ct:pal("Testing unified put_private"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Conn} = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    {ok, Conn} = gen_http:connect(http, <<"127.0.0.1">>, Port),
 
     Conn2 = gen_http:put_private(Conn, pool_id, unified_pool),
     Conn3 = gen_http:put_private(Conn2, request_count, 0),
 
-    %% Verify state is still valid
     ?assert(gen_http:is_open(Conn3)),
 
     {ok, _} = gen_http:close(Conn3),
     ok.
 
-unified_get_private(_Config) ->
+unified_get_private(Config) ->
     ct:pal("Testing unified get_private"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Conn} = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    {ok, Conn} = gen_http:connect(http, <<"127.0.0.1">>, Port),
 
-    %% Get from empty private storage
     ?assertEqual(undefined, gen_http:get_private(Conn, pool_id)),
 
-    %% Store and retrieve
     Conn2 = gen_http:put_private(Conn, pool_id, unified_pool),
     ?assertEqual(unified_pool, gen_http:get_private(Conn2, pool_id)),
 
-    %% Get with default value
     ?assertEqual(default_val, gen_http:get_private(Conn2, missing_key, default_val)),
 
     {ok, _} = gen_http:close(Conn2),
     ok.
 
-unified_delete_private(_Config) ->
+unified_delete_private(Config) ->
     ct:pal("Testing unified delete_private"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Conn} = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    {ok, Conn} = gen_http:connect(http, <<"127.0.0.1">>, Port),
 
     Conn2 = gen_http:put_private(Conn, key1, value1),
     Conn3 = gen_http:put_private(Conn2, key2, value2),
 
-    %% Verify both exist
     ?assertEqual(value1, gen_http:get_private(Conn3, key1)),
     ?assertEqual(value2, gen_http:get_private(Conn3, key2)),
 
-    %% Delete one key
     Conn4 = gen_http:delete_private(Conn3, key1),
 
-    %% Verify key1 is gone but key2 remains
     ?assertEqual(undefined, gen_http:get_private(Conn4, key1)),
     ?assertEqual(value2, gen_http:get_private(Conn4, key2)),
 
@@ -380,7 +361,6 @@ unified_delete_private(_Config) ->
 
 unified_classify_error(_Config) ->
     ct:pal("Testing unified classify_error"),
-    %% Test error classification through unified interface
     Transport = {transport_error, closed},
     Protocol = {protocol_error, invalid_status_line},
     Application = {application_error, pipeline_full},
@@ -392,7 +372,6 @@ unified_classify_error(_Config) ->
 
 unified_is_retriable_error(_Config) ->
     ct:pal("Testing unified is_retriable_error"),
-    %% Test retriable error checking through unified interface
     Transport = {transport_error, closed},
     Protocol = {protocol_error, invalid_status_line},
     AppClosed = {application_error, connection_closed},
@@ -408,20 +387,20 @@ unified_is_retriable_error(_Config) ->
 %% Connection State Tests
 %%====================================================================
 
-unified_is_open(_Config) ->
+unified_is_open(Config) ->
     ct:pal("Testing unified is_open"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Conn} = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    {ok, Conn} = gen_http:connect(http, <<"127.0.0.1">>, Port),
     ?assert(gen_http:is_open(Conn)),
 
     {ok, Conn2} = gen_http:close(Conn),
     ?assertNot(gen_http:is_open(Conn2)),
     ok.
 
-unified_get_socket(_Config) ->
+unified_get_socket(Config) ->
     ct:pal("Testing unified get_socket"),
-    {http, Host, Port} = test_helper:http_server(),
-    {ok, Conn} = gen_http:connect(http, list_to_binary(Host), Port),
+    Port = ?config(http_port, Config),
+    {ok, Conn} = gen_http:connect(http, <<"127.0.0.1">>, Port),
     Socket = gen_http:get_socket(Conn),
     ?assert(Socket =/= undefined),
     {ok, _} = gen_http:close(Conn),
