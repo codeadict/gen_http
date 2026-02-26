@@ -6,8 +6,13 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    permissions:
+      checks: write
     name: OTP ${{ matrix.otp }} / rebar3 ${{ matrix.rebar3 }}
     runs-on: ubuntu-latest
 
