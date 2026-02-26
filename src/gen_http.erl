@@ -19,6 +19,7 @@
     connect/4,
     close/1,
     is_open/1,
+    is_alive/1,
     get_socket/1,
     set_mode/2,
     controlling_process/2,
@@ -82,6 +83,10 @@
     invalid_status_line
     | invalid_header
     | invalid_chunk_size
+    | chunk_size_overflow
+    | too_many_headers
+    | conflicting_content_length
+    | invalid_trailer
     | invalid_content_length
     | {unknown_transfer_encoding, binary()}
     | {parse_error, term()}.
@@ -111,7 +116,9 @@
     connection_closed
     | pipeline_full
     | {invalid_request_ref, reference()}
-    | unexpected_close.
+    | unexpected_close
+    | {incomplete_body, non_neg_integer(), non_neg_integer()}
+    | incomplete_chunked_body.
 
 %% @doc Structured error reason.
 %%
@@ -377,6 +384,19 @@ is_open(Conn) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:is_open(Conn)
     end.
 
+%% @doc Check if the underlying socket is still alive.
+%%
+%% Does a non-blocking recv to detect if the server has closed the connection
+%% while it was idle. Useful for connection pool implementations.
+%%
+%% Works with both HTTP/1.1 and HTTP/2 connections.
+-spec is_alive(conn()) -> boolean().
+is_alive(Conn) when is_tuple(Conn) ->
+    case element(1, Conn) of
+        gen_http_h1_conn -> gen_http_h1:is_alive(Conn);
+        gen_http_h2_conn -> gen_http_h2:is_alive(Conn)
+    end.
+
 %% @doc Get the underlying socket.
 %%
 %% Works with both HTTP/1.1 and HTTP/2 connections.
@@ -473,6 +493,10 @@ delete_private(Conn, Key) when is_tuple(Conn) ->
 -spec is_retriable_error(error_reason()) -> boolean().
 is_retriable_error({transport_error, _}) ->
     %% Transport errors are generally retriable
+    true;
+is_retriable_error({protocol_error, {rst_stream, refused_stream}}) ->
+    %% RFC 9113 Section 8.7: server rejected the stream without processing it.
+    %% Safe to retry on a new connection.
     true;
 is_retriable_error({protocol_error, _}) ->
     %% Protocol errors indicate incompatibility or bugs
@@ -617,10 +641,25 @@ is_not_retriable_protocol_errors_test() ->
     ?assertNot(is_retriable_error({protocol_error, {frame_size_error, 100}})),
     ?assertNot(is_retriable_error({protocol_error, max_concurrent_streams_exceeded})).
 
+refused_stream_is_retriable_test() ->
+    %% RFC 9113 Section 8.7: refused_stream means the server rejected
+    %% the stream without processing it, safe to retry
+    ?assert(is_retriable_error({protocol_error, {rst_stream, refused_stream}})).
+
+other_rst_stream_not_retriable_test() ->
+    %% Other RST_STREAM error codes are not retriable
+    ?assertNot(is_retriable_error({protocol_error, {rst_stream, stream_closed}})),
+    ?assertNot(is_retriable_error({protocol_error, {rst_stream, cancel}})).
+
 is_retriable_some_application_errors_test() ->
     %% Some application errors are retriable
     ?assert(is_retriable_error({application_error, connection_closed})),
     ?assert(is_retriable_error({application_error, unexpected_close})).
+
+incomplete_body_errors_not_retriable_test() ->
+    %% Incomplete body errors are application-level, not retriable
+    ?assertNot(is_retriable_error({application_error, {incomplete_body, 500, 1000}})),
+    ?assertNot(is_retriable_error({application_error, incomplete_chunked_body})).
 
 is_not_retriable_some_application_errors_test() ->
     %% Some application errors are not retriable
