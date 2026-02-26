@@ -327,7 +327,9 @@ informational_100_continue(_Config) ->
     end),
 
     {ok, Conn} = gen_http_h1:connect(http, "localhost", Port, #{mode => passive}),
-    {ok, Conn2, _Ref} = gen_http_h1:request(Conn, <<"POST">>, <<"/">>, [{<<"expect">>, <<"100-continue">>}], <<"data">>),
+    {ok, Conn2, _Ref} = gen_http_h1:request(
+        Conn, <<"POST">>, <<"/">>, [{<<"expect">>, <<"100-continue">>}], <<"data">>
+    ),
 
     {ok, Conn3, Responses} = gen_http_h1:recv(Conn2, 0, 5000),
 
@@ -350,7 +352,10 @@ informational_103_early_hints(_Config) ->
     spawn_link(fun() ->
         {ok, Socket} = gen_tcp:accept(ListenSocket),
         {ok, _} = gen_tcp:recv(Socket, 0, 5000),
-        ok = gen_tcp:send(Socket, <<"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK">>),
+        ok = gen_tcp:send(
+            Socket,
+            <<"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK">>
+        ),
         gen_tcp:close(Socket)
     end),
 
