@@ -45,6 +45,7 @@
     put_log/2,
     close/1,
     is_open/1,
+    is_alive/1,
     get_socket/1,
     get_window_size/2,
     put_private/3,
@@ -84,9 +85,11 @@
 %%====================================================================
 
 -define(CONNECTION_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
-%% Use 8MB window size (125x the RFC default of 65535).
-%% Larger windows reduce WINDOW_UPDATE frame overhead for real payloads.
--define(DEFAULT_WINDOW_SIZE, 8000000).
+%% 16MB connection-level window. Streams share this capacity so it
+%% should be large enough that no single stream blocks others.
+-define(CONN_WINDOW_SIZE, 16777216).
+%% 8MB per-stream window (125x the RFC default of 65535).
+-define(STREAM_WINDOW_SIZE, 8000000).
 -define(MAX_FRAME_SIZE, 16384).
 %% Cap accumulated header block size to prevent CONTINUATION flood (CVE-2024-27316)
 -define(MAX_HEADER_BLOCK_SIZE, 65536).
@@ -98,7 +101,7 @@
     header_table_size => 4096,
     enable_push => false,
     max_concurrent_streams => 100,
-    initial_window_size => ?DEFAULT_WINDOW_SIZE,
+    initial_window_size => ?STREAM_WINDOW_SIZE,
     max_frame_size => ?MAX_FRAME_SIZE,
     max_header_list_size => undefined
 }).
@@ -126,9 +129,9 @@
     max_concurrent = 100 :: pos_integer(),
 
     %% Flow Control
-    send_window = ?DEFAULT_WINDOW_SIZE :: non_neg_integer(),
-    recv_window = ?DEFAULT_WINDOW_SIZE :: non_neg_integer(),
-    initial_window_size = ?DEFAULT_WINDOW_SIZE :: pos_integer(),
+    send_window = ?CONN_WINDOW_SIZE :: non_neg_integer(),
+    recv_window = ?CONN_WINDOW_SIZE :: non_neg_integer(),
+    initial_window_size = ?STREAM_WINDOW_SIZE :: pos_integer(),
 
     %% Settings
     local_settings = #{} :: map(),
@@ -238,7 +241,7 @@ connect_impl(Scheme, Address, Port, Opts) ->
             max_buffer_size = MaxBufferSize,
             hpack_encode = HpackEncode,
             hpack_decode = HpackDecode,
-            initial_window_size = ?DEFAULT_WINDOW_SIZE,
+            initial_window_size = ?STREAM_WINDOW_SIZE,
             local_settings = ?DEFAULT_SETTINGS
         },
         %% Send connection preface and initial SETTINGS
@@ -392,6 +395,22 @@ close(Conn) ->
 is_open(#gen_http_h2_conn{state = State}) ->
     State =:= open.
 
+%% @doc Check if the underlying socket is still alive.
+%%
+%% Does a non-blocking recv to detect if the server has closed the connection
+%% while it was idle. Useful for connection pool implementations that want to
+%% avoid sending requests on stale connections.
+-spec is_alive(conn()) -> boolean().
+is_alive(#gen_http_h2_conn{state = State}) when State =:= closed; State =:= closing ->
+    false;
+is_alive(#gen_http_h2_conn{transport = Transport, socket = Socket}) ->
+    case Transport:recv(Socket, 0, 0) of
+        {error, timeout} -> true;
+        {error, closed} -> false;
+        {ok, _Data} -> false;
+        {error, _} -> false
+    end.
+
 %% @doc Get the underlying socket.
 -spec get_socket(conn()) -> socket().
 get_socket(#gen_http_h2_conn{socket = Socket}) ->
@@ -480,7 +499,7 @@ ensure_binary(Addr) when is_atom(Addr) -> atom_to_binary(Addr, utf8).
 %% The SETTINGS frame advertises our stream-level initial_window_size.
 %% RFC 7540 Section 6.9.2: the connection-level window starts at 65535
 %% and can only be increased via WINDOW_UPDATE, so we send one to raise
-%% it to DEFAULT_WINDOW_SIZE.
+%% it to CONN_WINDOW_SIZE.
 -spec send_preface(conn()) -> conn().
 send_preface(Conn) ->
     #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
@@ -499,7 +518,7 @@ send_preface(Conn) ->
 
     %% Send connection-level WINDOW_UPDATE to raise from RFC default (65535)
     %% to our desired window size. Batched into a single send with the preface.
-    ConnWindowIncrement = ?DEFAULT_WINDOW_SIZE - 65535,
+    ConnWindowIncrement = ?CONN_WINDOW_SIZE - 65535,
     WindowUpdate = #window_update{
         stream_id = 0,
         window_size_increment = ConnWindowIncrement
@@ -1088,9 +1107,9 @@ handle_data_frame(Conn, StreamId, #data{flags = Flags, data = Data}) ->
                     true ->
                         {<<>>, NewRecvWindow};
                     false ->
-                        case NewRecvWindow < (?DEFAULT_WINDOW_SIZE div 2) of
+                        case NewRecvWindow < (?STREAM_WINDOW_SIZE div 2) of
                             true ->
-                                Increment = ?DEFAULT_WINDOW_SIZE - NewRecvWindow,
+                                Increment = ?STREAM_WINDOW_SIZE - NewRecvWindow,
                                 StreamWu = #window_update{
                                     stream_id = StreamId,
                                     window_size_increment = Increment
@@ -1102,9 +1121,9 @@ handle_data_frame(Conn, StreamId, #data{flags = Flags, data = Data}) ->
                 end,
 
             {ConnWuData, FinalConnWindow} =
-                case ConnRecvWindow < (?DEFAULT_WINDOW_SIZE div 2) of
+                case ConnRecvWindow < (?CONN_WINDOW_SIZE div 2) of
                     true ->
-                        Increment2 = ?DEFAULT_WINDOW_SIZE - ConnRecvWindow,
+                        Increment2 = ?CONN_WINDOW_SIZE - ConnRecvWindow,
                         ConnWu = #window_update{
                             stream_id = 0,
                             window_size_increment = Increment2
