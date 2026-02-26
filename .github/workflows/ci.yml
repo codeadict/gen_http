@@ -86,7 +86,7 @@ jobs:
 
       - name: Generate coverage report
         if: ${{ matrix.coverage }}
-        run: rebar3 as test covertool generate
+        run: rebar3 covertool generate
 
       - name: Upload coverage to Codecov
         if: ${{ matrix.coverage }}
