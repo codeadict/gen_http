@@ -1,59 +1,24 @@
-.PHONY: help compile test test-integration test-unit test-proper clean dialyzer xref format \
-	server-start server-stop server-status server-logs server-health
+# See LICENSE for licensing information.
 
-help:  ## Show this help message
-	@echo 'Usage: make [target]'
-	@echo ''
-	@echo 'Available targets:'
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+PROJECT = gen_http
+PROJECT_DESCRIPTION = Erlang native HTTP client with support for HTTP/1 and HTTP/2.
+PROJECT_VERSION = 0.1.0
 
-compile: ## Compile the project
-	rebar3 compile
+# Options.
 
-clean: ## Clean build artifacts
-	rebar3 clean
+ERLC_OPTS = +debug_info
 
-format: ## Format code with erlfmt
-	rebar3 fmt -w
+# Dependencies.
 
-test: ## Run all tests (requires test server)
-	rebar3 test
+LOCAL_DEPS = crypto ssl
 
-dialyzer: ## Run Dialyzer type checker
-	rebar3 dialyzer
+# Standard targets.
 
-xref: ## Run cross-reference analysis
-	rebar3 xref
+ifndef ERLANG_MK_FILENAME
+ERLANG_MK_VERSION = 2024.07.02
 
-# Test server management
-server-start: ## Start test server (Docker Compose)
-	@echo "Starting test server..."
-	docker compose -f test/support/docker-compose.yml up -d
-	@echo "Waiting for services to be healthy..."
-	@timeout 30 sh -c 'until docker compose -f test/support/docker-compose.yml ps | grep -q "(healthy)"; do sleep 1; done' || \
-		(echo "Timeout waiting for services" && exit 1)
-	@echo "✓ Test server ready at http://localhost:8080 and https://localhost:8443"
+erlang.mk:
+	curl -o $@ https://raw.githubusercontent.com/ninenines/erlang.mk/v$(ERLANG_MK_VERSION)/erlang.mk
+endif
 
-server-stop: ## Stop test server
-	docker compose -f test/support/docker-compose.yml down
-
-server-status: ## Show test server status
-	docker compose -f test/support/docker-compose.yml ps
-
-server-logs: ## Show test server logs
-	docker compose -f test/support/docker-compose.yml logs -f
-
-server-health: ## Check if test server is healthy
-	@curl -sf http://localhost:8080/status/200 > /dev/null && \
-		echo "✓ HTTP server is healthy" || \
-		echo "✗ HTTP server not responding"
-	@curl -sfk https://localhost:8443/status/200 > /dev/null && \
-		echo "✓ HTTPS server is healthy" || \
-		echo "✗ HTTPS server not responding"
-
-# Common workflows
-dev: compile test ## Compile and run tests
-
-ci: clean compile dialyzer xref test ## Run full CI pipeline
-
-.DEFAULT_GOAL := help
+include $(if $(ERLANG_MK_FILENAME),$(ERLANG_MK_FILENAME),erlang.mk)
