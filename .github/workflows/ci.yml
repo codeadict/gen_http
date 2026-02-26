@@ -73,18 +73,12 @@ jobs:
       - name: Install nghttpx
         run: sudo apt-get update && sudo apt-get install -y nghttp2-tools
 
-      - name: Run EUnit tests
-        run: rebar3 eunit --cover
-
-      - name: Run Common Test
-        id: ct
-        run: rebar3 ct --cover
-
-      - name: Run PropEr tests
-        run: rebar3 proper --cover
+      - name: Run tests
+        id: test
+        run: rebar3 test
 
       - name: Upload CT logs on failure
-        if: ${{ failure() && steps.ct.outcome == 'failure' }}
+        if: ${{ failure() && steps.test.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
           name: ct-logs-otp-${{ matrix.otp }}
@@ -101,4 +95,3 @@ jobs:
           files: _build/test/cover/eunit.coverdata,_build/test/cover/ct.coverdata,_build/test/cover/proper.coverdata
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
-

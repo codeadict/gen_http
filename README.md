@@ -1,6 +1,7 @@
 # gen_http
 
 [![CI](https://github.com/codeadict/gen_http/actions/workflows/ci.yml/badge.svg)](https://github.com/codeadict/gen_http/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/github/codeadict/gen_http/graph/badge.svg?token=Y07BA8DQ6T)](https://codecov.io/github/codeadict/gen_http)
 [![HTTP/2 Compliance](https://github.com/codeadict/gen_http/actions/workflows/h2-compliance.yml/badge.svg)](https://github.com/codeadict/gen_http/actions/workflows/h2-compliance.yml)
 [![RFC 7540](https://img.shields.io/badge/RFC%207540-compliant-brightgreen)](https://datatracker.ietf.org/doc/html/rfc7540)
 [![RFC 7541](https://img.shields.io/badge/RFC%207541-compliant-brightgreen)](https://datatracker.ietf.org/doc/html/rfc7541)
