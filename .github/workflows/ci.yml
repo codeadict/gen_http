@@ -94,7 +94,7 @@ jobs:
         with:
           files: _build/test/covertool/gen_http.covertool.xml
           fail_ci_if_error: false
-          flags: erlang-${{ matrix.otp }},os-${{ matrix.os }}
-          name: Erlang/OTP ${{ matrix.otp }} on ${{ matrix.os }}
+          flags: erlang-${{ matrix.otp }}
+          name: Erlang/OTP ${{ matrix.otp }}
           verbose: true # optional (default = false)
           token: ${{ secrets.CODECOV_TOKEN }}
