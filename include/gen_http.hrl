@@ -9,6 +9,7 @@
     {status, request_ref(), status()}
     | {headers, request_ref(), headers()}
     | {data, request_ref(), binary()}
+    | {trailers, request_ref(), headers()}
     | {done, request_ref()}
     | {error, request_ref(), term()}.
 -type socket() :: gen_tcp:socket() | ssl:sslsocket().
