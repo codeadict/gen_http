@@ -21,3 +21,9 @@ caddy_config/
 
 # Environment
 .env
+
+# Erlang mk
+*.d
+ebin/
+.erlang.mk
+erlang.mk
