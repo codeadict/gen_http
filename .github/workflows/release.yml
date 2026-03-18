@@ -49,11 +49,6 @@ jobs:
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
-      - name: Publish docs to Hex
-        run: rebar3 hex docs publish --yes
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-
       - name: Extract release notes from CHANGELOG
         id: changelog
         run: |
