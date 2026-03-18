@@ -3,6 +3,9 @@
 [![CI](https://github.com/codeadict/gen_http/actions/workflows/ci.yml/badge.svg)](https://github.com/codeadict/gen_http/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/github/codeadict/gen_http/graph/badge.svg?token=Y07BA8DQ6T)](https://codecov.io/github/codeadict/gen_http)
 [![HTTP/2 Compliance](https://github.com/codeadict/gen_http/actions/workflows/h2-compliance.yml/badge.svg)](https://github.com/codeadict/gen_http/actions/workflows/h2-compliance.yml)
+[![Module Version](https://img.shields.io/hexpm/v/gen_http.svg)](https://hex.pm/packages/gen_http)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/gen_http/)
+[![Hex Downloads](https://img.shields.io/hexpm/dt/gen_http.svg)](https://hex.pm/packages/gen_http)
 [![RFC 7540](https://img.shields.io/badge/RFC%207540-compliant-brightgreen)](https://datatracker.ietf.org/doc/html/rfc7540)
 [![RFC 7541](https://img.shields.io/badge/RFC%207541-compliant-brightgreen)](https://datatracker.ietf.org/doc/html/rfc7541)
 
@@ -16,12 +19,20 @@ Fast. Small API. Proper HTTP/1.1 and HTTP/2 support. Works with both protocols t
 
 ## Quick Start
 
+### Erlang
+
 Add to your `rebar.config`:
 
 ```erlang
-{deps, [
-    {gen_http, {git, "https://github.com/codeadict/gen_http.git", {branch, "main"}}}
-]}.
+{deps, [gen_http]}.
+```
+
+### Elixir
+
+Add to your `mix.exs`:
+
+```elixir
+{:gen_http, "~> 0.1"}
 ```
 
 Send a request:
