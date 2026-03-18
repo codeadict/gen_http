@@ -45,7 +45,7 @@ jobs:
           echo "Documentation built successfully"
 
       - name: Publish to Hex
-        run: rebar3 hex publish --yes
+        run: rebar3 hex publish -r hexpm --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
