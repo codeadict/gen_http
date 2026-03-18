@@ -1,9 +1,5 @@
 -module(gen_http).
 
-%% @doc Unified interface for HTTP/1.1 and HTTP/2 connections.
-%%
-%% Protocol-agnostic functions that work with both gen_http_h1 and gen_http_h2.
-
 %% Targeted inlining for small dispatch/wrapper helpers
 -compile(
     {inline, [
@@ -12,6 +8,74 @@
 ).
 
 -include("include/gen_http.hrl").
+
+?MODULEDOC("""
+Unified interface for HTTP/1.1 and HTTP/2 connections.
+
+This is the main module. It wraps `gen_http_h1` and `gen_http_h2`
+behind a single API so your code doesn't need to care which protocol
+is running underneath.
+
+## Basic Usage
+
+Connect, send a request, collect the response:
+
+```erlang
+{ok, Conn} = gen_http:connect(https, "httpbin.org", 443),
+{ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
+
+%% Active mode -- socket delivers messages to your process
+receive
+    Msg ->
+        {ok, Conn3, Responses} = gen_http:stream(Conn2, Msg)
+end.
+```
+
+The response comes back as a list of tagged tuples:
+
+```erlang
+[{status, Ref, 200},
+ {headers, Ref, [{<<"content-type">>, <<"application/json">>}]},
+ {data, Ref, <<"body">>},
+ {done, Ref}]
+```
+
+## Connection Lifecycle
+
+The connection is a plain data structure. No processes are spawned.
+Every function returns an updated connection that you pass to the
+next call.
+
+```erlang
+{ok, Conn}  = gen_http:connect(https, Host, 443),
+{ok, Conn2, Ref} = gen_http:request(Conn, Method, Path, Headers, Body),
+{ok, Conn3, Responses} = gen_http:recv(Conn2, 0, 5000),
+{ok, Conn4} = gen_http:close(Conn3).
+```
+
+## Protocol Negotiation
+
+For HTTPS, the protocol is negotiated via ALPN during the TLS handshake.
+By default, both HTTP/2 and HTTP/1.1 are offered, with HTTP/2 preferred.
+
+For plain HTTP, the connection always uses HTTP/1.1.
+
+## Response Events
+
+Both protocols produce the same event types:
+
+- `{status, Ref, StatusCode}` -- HTTP status code
+- `{headers, Ref, Headers}` -- response headers
+- `{data, Ref, Binary}` -- body chunk
+- `{done, Ref}` -- response complete
+- `{error, Ref, Reason}` -- stream-level error
+
+## Error Handling
+
+Errors are categorized as transport, protocol, or application errors.
+Use `is_retriable_error/1` to decide whether to retry.
+See `classify_error/1` for the error category.
+""").
 
 -export([
     %% Connection management
@@ -58,7 +122,7 @@
 %% Structured Error Types
 %%====================================================================
 
-%% @doc Transport-level errors (network, socket, DNS).
+%% Transport-level errors (network, socket, DNS).
 %%
 %% These errors are typically retryable after a delay or reconnection.
 -type transport_error() ::
@@ -75,7 +139,7 @@
     | {connect_failed, term()}
     | {controlling_process_failed, term()}.
 
-%% @doc HTTP/1.1 protocol errors.
+%% HTTP/1.1 protocol errors.
 %%
 %% These indicate protocol violations or malformed responses.
 %% Usually not retryable on the same connection.
@@ -91,7 +155,7 @@
     | {unknown_transfer_encoding, binary()}
     | {parse_error, term()}.
 
-%% @doc HTTP/2 protocol errors.
+%% HTTP/2 protocol errors.
 %%
 %% These indicate HTTP/2 frame or stream errors.
 %% Usually not retryable on the same connection.
@@ -109,7 +173,7 @@
     | {rst_stream, term()}
     | max_concurrent_streams_exceeded.
 
-%% @doc Application-level errors.
+%% Application-level errors.
 %%
 %% These are policy violations (not protocol errors).
 -type application_error() ::
@@ -120,7 +184,7 @@
     | {incomplete_body, non_neg_integer(), non_neg_integer()}
     | incomplete_chunked_body.
 
-%% @doc Structured error reason.
+%% Structured error reason.
 %%
 %% All errors are wrapped in one of these categories to make it easy
 %% to determine if an error is retryable.
@@ -133,42 +197,46 @@
 %% API Functions - Connection Management
 %%====================================================================
 
-%% @doc Connect to an HTTP server.
-%%
-%% Automatically negotiates HTTP/1.1 or HTTP/2 based on ALPN when using HTTPS.
-%% For HTTP (non-TLS), always uses HTTP/1.1.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% %% Connect to HTTP server
-%% {ok, Conn} = gen_http:connect(http, "example.com", 80).
-%%
-%% %% Connect to HTTPS server (negotiates HTTP/1.1 or HTTP/2)
-%% {ok, Conn} = gen_http:connect(https, "example.com", 443).
-%% ```
+?DOC("""
+Connect to an HTTP server.
+
+Automatically negotiates HTTP/1.1 or HTTP/2 based on ALPN when using HTTPS.
+For HTTP (non-TLS), always uses HTTP/1.1.
+
+## Examples
+
+```erlang
+%% Connect to HTTP server
+{ok, Conn} = gen_http:connect(http, "example.com", 80).
+
+%% Connect to HTTPS server (negotiates HTTP/1.1 or HTTP/2)
+{ok, Conn} = gen_http:connect(https, "example.com", 443).
+```
+""").
 -spec connect(scheme(), address(), inet:port_number()) ->
     {ok, conn()} | {error, error_reason()}.
 connect(Scheme, Address, Port) ->
     connect(Scheme, Address, Port, #{}).
 
-%% @doc Connect to an HTTP server with options.
-%%
-%% ## Options
-%%
-%%   - `mode` - Socket mode: `active` (default) or `passive`
-%%   - `timeout` - Connection timeout in milliseconds (default: 5000)
-%%   - `protocols` - List of protocols to negotiate for HTTPS: `[http1]`, `[http2]`, or `[http2, http1]` (default)
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% %% Connect in passive mode (for one-shot requests)
-%% {ok, Conn} = gen_http:connect(https, "example.com", 443, #{mode => passive}).
-%%
-%% %% Force HTTP/1.1 only
-%% {ok, Conn} = gen_http:connect(https, "example.com", 443, #{protocols => [http1]}).
-%% ```
+?DOC("""
+Connect to an HTTP server with options.
+
+## Options
+
+- `mode` - Socket mode: `active` (default) or `passive`
+- `timeout` - Connection timeout in milliseconds (default: 5000)
+- `protocols` - List of protocols to negotiate for HTTPS: `[http1]`, `[http2]`, or `[http2, http1]` (default)
+
+## Examples
+
+```erlang
+%% Connect in passive mode (for one-shot requests)
+{ok, Conn} = gen_http:connect(https, "example.com", 443, #{mode => passive}).
+
+%% Force HTTP/1.1 only
+{ok, Conn} = gen_http:connect(https, "example.com", 443, #{protocols => [http1]}).
+```
+""").
 -spec connect(scheme(), address(), inet:port_number(), map()) ->
     {ok, conn()} | {error, error_reason()}.
 connect(http, Address, Port, Opts) ->
@@ -179,7 +247,9 @@ connect(https, Address, Port, Opts) ->
     Protocols = maps:get(protocols, Opts, [http2, http1]),
     negotiate_protocol(https, Address, Port, Opts, Protocols).
 
-%% @doc Close the connection.
+?DOC("""
+Close the connection.
+""").
 -spec close(conn()) -> {ok, conn()}.
 close(Conn) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -187,31 +257,33 @@ close(Conn) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:close(Conn)
     end.
 
-%% @doc Switch the connection socket mode between active and passive.
-%%
-%% Active mode (default):
-%%   - Socket delivers messages to the owning process automatically
-%%   - Uses `{active, once}` for flow control
-%%   - Process messages with `stream/2`
-%%
-%% Passive mode:
-%%   - Explicit data retrieval using `recv/3`
-%%   - Blocks until data is available
-%%   - Useful for request/response patterns
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% %% Start in active mode
-%% {ok, Conn} = gen_http:connect(https, "example.com", 443),
-%%
-%% %% Switch to passive mode for blocking I/O
-%% {ok, Conn2} = gen_http:set_mode(Conn, passive),
-%% {ok, Conn3, Responses} = gen_http:recv(Conn2, 0, 5000),
-%%
-%% %% Switch back to active mode
-%% {ok, Conn4} = gen_http:set_mode(Conn3, active),
-%% ```
+?DOC("""
+Switch the connection socket mode between active and passive.
+
+Active mode (default):
+- Socket delivers messages to the owning process automatically
+- Uses `{active, once}` for flow control
+- Process messages with `stream/2`
+
+Passive mode:
+- Explicit data retrieval using `recv/3`
+- Blocks until data is available
+- Useful for request/response patterns
+
+## Examples
+
+```erlang
+%% Start in active mode
+{ok, Conn} = gen_http:connect(https, "example.com", 443),
+
+%% Switch to passive mode for blocking I/O
+{ok, Conn2} = gen_http:set_mode(Conn, passive),
+{ok, Conn3, Responses} = gen_http:recv(Conn2, 0, 5000),
+
+%% Switch back to active mode
+{ok, Conn4} = gen_http:set_mode(Conn3, active),
+```
+""").
 -spec set_mode(conn(), active | passive) -> {ok, conn()} | {error, conn(), error_reason()}.
 set_mode(Conn, Mode) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -219,25 +291,27 @@ set_mode(Conn, Mode) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:set_mode(Conn, Mode)
     end.
 
-%% @doc Transfer socket ownership to another process.
-%%
-%% This is useful for connection pooling patterns where you want to hand off
-%% an established connection to a worker process.
-%%
-%% After calling this, the new process will receive socket messages.
-%% Make sure to transfer ownership BEFORE switching to active mode, otherwise
-%% messages may be lost.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% %% Create connection in one process
-%% {ok, Conn} = gen_http:connect(https, "example.com", 443),
-%%
-%% %% Transfer to worker process
-%% WorkerPid = spawn_worker(),
-%% {ok, Conn2} = gen_http:controlling_process(Conn, WorkerPid),
-%% ```
+?DOC("""
+Transfer socket ownership to another process.
+
+This is useful for connection pooling patterns where you want to hand off
+an established connection to a worker process.
+
+After calling this, the new process will receive socket messages.
+Make sure to transfer ownership BEFORE switching to active mode, otherwise
+messages may be lost.
+
+## Examples
+
+```erlang
+%% Create connection in one process
+{ok, Conn} = gen_http:connect(https, "example.com", 443),
+
+%% Transfer to worker process
+WorkerPid = spawn_worker(),
+{ok, Conn2} = gen_http:controlling_process(Conn, WorkerPid),
+```
+""").
 -spec controlling_process(conn(), pid()) -> {ok, conn()} | {error, conn(), error_reason()}.
 controlling_process(Conn, Pid) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -245,23 +319,25 @@ controlling_process(Conn, Pid) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:controlling_process(Conn, Pid)
     end.
 
-%% @doc Enable or disable debug logging for this connection.
-%%
-%% When enabled, the connection will log debug information about frames,
-%% requests, and responses. This is useful for debugging but adds overhead.
-%%
-%% Logging is disabled by default for maximum performance.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% %% Enable logging for debugging
-%% {ok, Conn} = gen_http:connect(https, "example.com", 443),
-%% {ok, Conn2} = gen_http:put_log(Conn, true),
-%%
-%% %% Disable logging
-%% {ok, Conn3} = gen_http:put_log(Conn2, false),
-%% ```
+?DOC("""
+Enable or disable debug logging for this connection.
+
+When enabled, the connection will log debug information about frames,
+requests, and responses. This is useful for debugging but adds overhead.
+
+Logging is disabled by default for maximum performance.
+
+## Examples
+
+```erlang
+%% Enable logging for debugging
+{ok, Conn} = gen_http:connect(https, "example.com", 443),
+{ok, Conn2} = gen_http:put_log(Conn, true),
+
+%% Disable logging
+{ok, Conn3} = gen_http:put_log(Conn2, false),
+```
+""").
 -spec put_log(conn(), boolean()) -> {ok, conn()}.
 put_log(Conn, Log) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -273,17 +349,19 @@ put_log(Conn, Log) when is_tuple(Conn) ->
 %% API Functions - Request/Response
 %%====================================================================
 
-%% @doc Send an HTTP request.
-%%
-%% Works with both HTTP/1.1 and HTTP/2 connections.
-%% Returns a request reference that identifies this request in responses.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% {ok, Conn} = gen_http:connect(https, "httpbin.org", 443),
-%% {ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>).
-%% ```
+?DOC("""
+Send an HTTP request.
+
+Works with both HTTP/1.1 and HTTP/2 connections.
+Returns a request reference that identifies this request in responses.
+
+## Examples
+
+```erlang
+{ok, Conn} = gen_http:connect(https, "httpbin.org", 443),
+{ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>).
+```
+""").
 -spec request(conn(), binary(), binary(), headers(), iodata() | stream) ->
     {ok, conn(), reference()}
     | {error, conn(), error_reason()}.
@@ -298,24 +376,26 @@ request(Conn, Method, Path, Headers, Body) when is_tuple(Conn) ->
             end
     end.
 
-%% @doc Process incoming socket messages.
-%%
-%% Works with both HTTP/1.1 and HTTP/2 connections.
-%% Returns list of responses (status, headers, data, done, errors).
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% receive
-%%     Msg when is_tuple(Msg), element(1, Msg) =:= tcp; element(1, Msg) =:= ssl ->
-%%         case gen_http:stream(Conn, Msg) of
-%%             {ok, Conn2, Responses} ->
-%%                 process_responses(Responses);
-%%             {error, Conn2, Reason, Responses} ->
-%%                 handle_error(Reason)
-%%         end
-%% end.
-%% ```
+?DOC("""
+Process incoming socket messages.
+
+Works with both HTTP/1.1 and HTTP/2 connections.
+Returns list of responses (status, headers, data, done, errors).
+
+## Examples
+
+```erlang
+receive
+    Msg when is_tuple(Msg), element(1, Msg) =:= tcp; element(1, Msg) =:= ssl ->
+        case gen_http:stream(Conn, Msg) of
+            {ok, Conn2, Responses} ->
+                process_responses(Responses);
+            {error, Conn2, Reason, Responses} ->
+                handle_error(Reason)
+        end
+end.
+```
+""").
 -spec stream(conn(), term()) ->
     {ok, conn(), [response()]}
     | {error, conn(), error_reason(), [response()]}
@@ -335,26 +415,28 @@ stream(Conn, Message) when is_tuple(Conn) ->
             end
     end.
 
-%% @doc Receive data from the connection in passive mode.
-%%
-%% This function blocks until data is received or timeout occurs.
-%% The connection must be in passive mode (see `connect/4` with `mode => passive`),
-%% otherwise this function raises a `badarg` error.
-%%
-%% Use this when you want explicit control over when to receive data,
-%% as opposed to active mode where messages are delivered to your process automatically.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% %% Connect in passive mode
-%% {ok, Conn} = gen_http:connect(https, "httpbin.org", 443, #{mode => passive}),
-%% {ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
-%%
-%% %% Explicitly receive data (0 = all available data, 5000ms timeout)
-%% {ok, Conn3, Responses} = gen_http:recv(Conn2, 0, 5000),
-%% %% Responses contains parsed HTTP messages
-%% ```
+?DOC("""
+Receive data from the connection in passive mode.
+
+This function blocks until data is received or timeout occurs.
+The connection must be in passive mode (see `connect/4` with `mode => passive`),
+otherwise this function raises a `badarg` error.
+
+Use this when you want explicit control over when to receive data,
+as opposed to active mode where messages are delivered to your process automatically.
+
+## Examples
+
+```erlang
+%% Connect in passive mode
+{ok, Conn} = gen_http:connect(https, "httpbin.org", 443, #{mode => passive}),
+{ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
+
+%% Explicitly receive data (0 = all available data, 5000ms timeout)
+{ok, Conn3, Responses} = gen_http:recv(Conn2, 0, 5000),
+%% Responses contains parsed HTTP messages
+```
+""").
 -spec recv(conn(), non_neg_integer(), timeout()) ->
     {ok, conn(), [response()]} | {error, conn(), error_reason()}.
 recv(Conn, ByteCount, Timeout) when is_tuple(Conn) ->
@@ -374,9 +456,11 @@ recv(Conn, ByteCount, Timeout) when is_tuple(Conn) ->
 %% API Functions - Metadata
 %%====================================================================
 
-%% @doc Check if connection is open.
-%%
-%% Works with both HTTP/1.1 and HTTP/2 connections.
+?DOC("""
+Check if connection is open.
+
+Works with both HTTP/1.1 and HTTP/2 connections.
+""").
 -spec is_open(conn()) -> boolean().
 is_open(Conn) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -384,12 +468,14 @@ is_open(Conn) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:is_open(Conn)
     end.
 
-%% @doc Check if the underlying socket is still alive.
-%%
-%% Does a non-blocking recv to detect if the server has closed the connection
-%% while it was idle. Useful for connection pool implementations.
-%%
-%% Works with both HTTP/1.1 and HTTP/2 connections.
+?DOC("""
+Check if the underlying socket is still alive.
+
+Does a non-blocking recv to detect if the server has closed the connection
+while it was idle. Useful for connection pool implementations.
+
+Works with both HTTP/1.1 and HTTP/2 connections.
+""").
 -spec is_alive(conn()) -> boolean().
 is_alive(Conn) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -397,9 +483,11 @@ is_alive(Conn) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:is_alive(Conn)
     end.
 
-%% @doc Get the underlying socket.
-%%
-%% Works with both HTTP/1.1 and HTTP/2 connections.
+?DOC("""
+Get the underlying socket.
+
+Works with both HTTP/1.1 and HTTP/2 connections.
+""").
 -spec get_socket(conn()) -> socket().
 get_socket(Conn) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -407,21 +495,23 @@ get_socket(Conn) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:get_socket(Conn)
     end.
 
-%% @doc Store a private key-value pair in the connection.
-%%
-%% Attach metadata to connections (e.g., pool ID, metrics, tags).
-%% Works with both HTTP/1.1 and HTTP/2 connections.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% %% Tag connection with pool ID
-%% Conn2 = gen_http:put_private(Conn, pool_id, worker_pool_1),
-%%
-%% %% Attach custom metadata
-%% Conn3 = gen_http:put_private(Conn2, request_count, 0),
-%% Conn4 = gen_http:put_private(Conn3, created_at, erlang:timestamp()).
-%% ```
+?DOC("""
+Store a private key-value pair in the connection.
+
+Attach metadata to connections (e.g., pool ID, metrics, tags).
+Works with both HTTP/1.1 and HTTP/2 connections.
+
+## Examples
+
+```erlang
+%% Tag connection with pool ID
+Conn2 = gen_http:put_private(Conn, pool_id, worker_pool_1),
+
+%% Attach custom metadata
+Conn3 = gen_http:put_private(Conn2, request_count, 0),
+Conn4 = gen_http:put_private(Conn3, created_at, erlang:timestamp()).
+```
+""").
 -spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
 put_private(Conn, Key, Value) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -429,24 +519,28 @@ put_private(Conn, Key, Value) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:put_private(Conn, Key, Value)
     end.
 
-%% @doc Get a private value from the connection.
-%%
-%% Returns `undefined` if the key doesn't exist.
-%% Works with both HTTP/1.1 and HTTP/2 connections.
+?DOC("""
+Get a private value from the connection.
+
+Returns `undefined` if the key doesn't exist.
+Works with both HTTP/1.1 and HTTP/2 connections.
+""").
 -spec get_private(conn(), Key :: term()) -> term() | undefined.
 get_private(Conn, Key) ->
     get_private(Conn, Key, undefined).
 
-%% @doc Get a private value from the connection with a default.
-%%
-%% Works with both HTTP/1.1 and HTTP/2 connections.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% PoolId = gen_http:get_private(Conn, pool_id, default_pool),
-%% Count = gen_http:get_private(Conn, request_count, 0).
-%% ```
+?DOC("""
+Get a private value from the connection with a default.
+
+Works with both HTTP/1.1 and HTTP/2 connections.
+
+## Examples
+
+```erlang
+PoolId = gen_http:get_private(Conn, pool_id, default_pool),
+Count = gen_http:get_private(Conn, request_count, 0).
+```
+""").
 -spec get_private(conn(), Key :: term(), Default :: term()) -> term().
 get_private(Conn, Key, Default) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -454,9 +548,11 @@ get_private(Conn, Key, Default) when is_tuple(Conn) ->
         gen_http_h2_conn -> gen_http_h2:get_private(Conn, Key, Default)
     end.
 
-%% @doc Delete a private key from the connection.
-%%
-%% Works with both HTTP/1.1 and HTTP/2 connections.
+?DOC("""
+Delete a private key from the connection.
+
+Works with both HTTP/1.1 and HTTP/2 connections.
+""").
 -spec delete_private(conn(), Key :: term()) -> conn().
 delete_private(Conn, Key) when is_tuple(Conn) ->
     case element(1, Conn) of
@@ -468,28 +564,30 @@ delete_private(Conn, Key) when is_tuple(Conn) ->
 %% Error Classification
 %%====================================================================
 
-%% @doc Check if an error is retriable.
-%%
-%% Returns `true` for transport errors that may succeed if retried,
-%% `false` for protocol errors that indicate a bug or incompatibility.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% case gen_http_h1:request(Conn, <<"GET">>, <<"/">>, [], <<>>) of
-%%     {ok, Conn2, Ref} ->
-%%         {ok, Conn2, Ref};
-%%     {error, _Conn, Reason} ->
-%%         case gen_http:is_retriable_error(Reason) of
-%%             true ->
-%%                 %% Network error, try again
-%%                 retry_request();
-%%             false ->
-%%                 %% Protocol error or policy violation, don't retry
-%%                 {error, Reason}
-%%         end
-%% end.
-%% ```
+?DOC("""
+Check if an error is retriable.
+
+Returns `true` for transport errors that may succeed if retried,
+`false` for protocol errors that indicate a bug or incompatibility.
+
+## Examples
+
+```erlang
+case gen_http_h1:request(Conn, <<"GET">>, <<"/">>, [], <<>>) of
+    {ok, Conn2, Ref} ->
+        {ok, Conn2, Ref};
+    {error, _Conn, Reason} ->
+        case gen_http:is_retriable_error(Reason) of
+            true ->
+                %% Network error, try again
+                retry_request();
+            false ->
+                %% Protocol error or policy violation, don't retry
+                {error, Reason}
+        end
+end.
+```
+""").
 -spec is_retriable_error(error_reason()) -> boolean().
 is_retriable_error({transport_error, _}) ->
     %% Transport errors are generally retriable
@@ -511,25 +609,27 @@ is_retriable_error({application_error, _}) ->
     %% Other application errors (pipeline_full, invalid_ref) are not retriable
     false.
 
-%% @doc Classify an error reason into its category.
-%%
-%% Returns `transport`, `protocol`, or `application`.
-%%
-%% ## Examples
-%%
-%% ```erlang
-%% case gen_http:classify_error(ErrorReason) of
-%%     transport ->
-%%         %% Network issue, can retry
-%%         schedule_retry();
-%%     protocol ->
-%%         %% Protocol violation, log and alert
-%%         logger:error("Protocol error: ~p", [ErrorReason]);
-%%     application ->
-%%         %% Application policy violation
-%%         handle_application_error(ErrorReason)
-%% end.
-%% ```
+?DOC("""
+Classify an error reason into its category.
+
+Returns `transport`, `protocol`, or `application`.
+
+## Examples
+
+```erlang
+case gen_http:classify_error(ErrorReason) of
+    transport ->
+        %% Network issue, can retry
+        schedule_retry();
+    protocol ->
+        %% Protocol violation, log and alert
+        logger:error("Protocol error: ~p", [ErrorReason]);
+    application ->
+        %% Application policy violation
+        handle_application_error(ErrorReason)
+end.
+```
+""").
 -spec classify_error(error_reason()) -> transport | protocol | application.
 classify_error({transport_error, _}) -> transport;
 classify_error({protocol_error, _}) -> protocol;
@@ -539,9 +639,7 @@ classify_error({application_error, _}) -> application.
 %% Internal Functions
 %%====================================================================
 
-%% @doc Convert address to binary format.
-
-%% @doc Negotiate HTTP protocol via ALPN for HTTPS connections.
+%% Negotiate HTTP protocol via ALPN for HTTPS connections.
 -spec negotiate_protocol(scheme(), address(), inet:port_number(), map(), [http1 | http2]) ->
     {ok, conn()} | {error, error_reason()}.
 negotiate_protocol(https, Address, Port, Opts, Protocols) ->
@@ -580,7 +678,7 @@ negotiate_protocol(https, Address, Port, Opts, Protocols) ->
             gen_http_h1:connect(https, Address, Port, NewOpts)
     end.
 
-%% @doc Normalize HTTP/2 responses to the unified response() shape.
+%% Normalize HTTP/2 responses to the unified response() shape.
 %%
 %% HTTP/2 responses carry a stream_id that the unified interface strips.
 %% Headers responses also contain the :status pseudo-header which gets

@@ -3,6 +3,14 @@
 
 -include("include/gen_http.hrl").
 
+?MODULEDOC("""
+SSL/TLS transport for HTTPS connections.
+
+Implements the `gen_http_transport` behaviour using OTP's `ssl` module.
+Handles ALPN protocol negotiation, SNI, certificate verification,
+and TLS session reuse.
+""").
+
 -export([
     connect/3,
     upgrade/5,
@@ -19,19 +27,20 @@
 
 -export_type([address/0, scheme/0, socket/0]).
 
-%% @doc Establish an SSL/TLS connection with ALPN support.
-%%
-%% Opens an SSL socket with ALPN protocol advertisement for HTTP/2 and HTTP/1.1.
-%% The server will choose which protocol to use during the TLS handshake.
-%%
-%% Options:
-%%   - `timeout` (default 5000) - Connection timeout in milliseconds
-%%   - `alpn_advertise` (default [<<"h2">>, <<"http/1.1">>]) - Protocols to advertise
-%%   - `socket_opts` - Additional SSL options
-%%   - `verify` (default verify_peer) - Certificate verification mode
-%%   - `cacerts` - CA certificates for verification
-%%
-%% Returns `{ok, Socket}` on success or `{error, Reason}` on failure.
+?DOC("""
+Establish an SSL/TLS connection with ALPN support.
+
+Opens an SSL socket with ALPN protocol advertisement for HTTP/2 and HTTP/1.1.
+The server chooses which protocol to use during the TLS handshake.
+
+Options:
+
+- `timeout` (default 5000) - Connection timeout in milliseconds
+- `alpn_advertise` (default `[<<"h2">>, <<"http/1.1">>]`) - Protocols to advertise
+- `socket_opts` - Additional SSL options
+- `verify` (default `verify_peer`) - Certificate verification mode
+- `cacerts` - CA certificates for verification
+""").
 -spec connect(address(), inet:port_number(), proplists:proplist()) ->
     {ok, socket()} | {error, term()}.
 connect(Address, Port, Opts) ->
@@ -96,15 +105,18 @@ connect(Address, Port, Opts) ->
             Err
     end.
 
-%% @doc Upgrade a plain TCP socket to TLS with ALPN support.
-%%
-%% This is used for protocols that start with plaintext and upgrade to TLS
-%% (like HTTP/1.1 Upgrade or STARTTLS).
-%%
-%% Options:
-%%   - `timeout` (default 5000) - Handshake timeout
-%%   - `alpn_advertise` - Protocols to advertise via ALPN
-%%   - `socket_opts` - Additional SSL options
+?DOC("""
+Upgrade a plain TCP socket to TLS with ALPN support.
+
+Used for protocols that start with plaintext and upgrade to TLS
+(e.g., HTTP/1.1 Upgrade or STARTTLS).
+
+Options:
+
+- `timeout` (default 5000) - Handshake timeout
+- `alpn_advertise` - Protocols to advertise via ALPN
+- `socket_opts` - Additional SSL options
+""").
 -spec upgrade(socket(), scheme(), binary(), inet:port_number(), proplists:proplist()) ->
     {ok, socket()} | {error, term()}.
 upgrade(Socket, _OriginalScheme, Hostname, _Port, Opts) ->
@@ -122,12 +134,15 @@ upgrade(Socket, _OriginalScheme, Hostname, _Port, Opts) ->
 
     ssl:connect(Socket, SSLOpts, Timeout).
 
-%% @doc Get the protocol negotiated via ALPN during TLS handshake.
-%%
-%% Returns:
-%%   - `{ok, <<"h2">>}` if HTTP/2 was negotiated
-%%   - `{ok, <<"http/1.1">>}` if HTTP/1.1 was negotiated
-%%   - `{error, protocol_not_negotiated}` if ALPN was not used
+?DOC("""
+Get the protocol negotiated via ALPN during the TLS handshake.
+
+Returns:
+
+- `{ok, <<"h2">>}` if HTTP/2 was negotiated
+- `{ok, <<"http/1.1">>}` if HTTP/1.1 was negotiated
+- `{error, protocol_not_negotiated}` if ALPN was not used
+""").
 -spec negotiated_protocol(socket()) ->
     {ok, binary()} | {error, protocol_not_negotiated}.
 negotiated_protocol(Socket) ->
@@ -136,52 +151,53 @@ negotiated_protocol(Socket) ->
         {error, protocol_not_negotiated} -> {error, protocol_not_negotiated}
     end.
 
-%% @doc Send data through the SSL socket.
+?DOC("Send data through the SSL socket.").
 -spec send(socket(), iodata()) -> ok | {error, term()}.
 send(Socket, Data) ->
     ssl:send(Socket, Data).
 
-%% @doc Close the SSL socket.
+?DOC("Close the SSL socket.").
 -spec close(socket()) -> ok | {error, term()}.
 close(Socket) ->
     ssl:close(Socket).
 
-%% @doc Set socket options.
+?DOC("Set socket options.").
 -spec setopts(socket(), list()) -> ok | {error, term()}.
 setopts(Socket, Opts) ->
     ssl:setopts(Socket, Opts).
 
-%% @doc Transfer socket ownership to another process.
+?DOC("Transfer socket ownership to another process.").
 -spec controlling_process(socket(), pid()) -> ok | {error, term()}.
 controlling_process(Socket, Pid) ->
     ssl:controlling_process(Socket, Pid).
 
-%% @doc Receive data from the SSL socket in passive mode.
-%%
-%% This function blocks until data is received or timeout occurs.
-%% Length of 0 means receive all available data.
-%%
-%% Returns `{ok, Data}` on success, `{error, closed}` if socket closed,
-%% or `{error, Reason}` on other errors.
+?DOC("""
+Receive data from the SSL socket in passive mode.
+
+Blocks until data is received or timeout occurs.
+A `Length` of 0 means receive all available data.
+""").
 -spec recv(socket(), non_neg_integer(), timeout()) ->
     {ok, binary() | list()} | {error, term()}.
 recv(Socket, Length, Timeout) ->
     ssl:recv(Socket, Length, Timeout).
 
-%% @doc Get the remote address and port.
+?DOC("Get the remote address and port.").
 -spec peername(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Socket) ->
     ssl:peername(Socket).
 
-%% @doc Get the local address and port.
+?DOC("Get the local address and port.").
 -spec sockname(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 sockname(Socket) ->
     ssl:sockname(Socket).
 
-%% @doc Get socket statistics (bytes sent/received, etc.).
-%%
-%% The ssl module does not expose getstat. Use peername/1 and
-%% sockname/1 for connection identification instead.
+?DOC("""
+Get socket statistics.
+
+The `ssl` module does not expose `getstat`,
+so this always returns `{error, not_supported}`.
+""").
 -spec getstat(socket()) -> {ok, [{atom(), integer()}]} | {error, term()}.
 getstat(_Socket) ->
     {error, not_supported}.
@@ -214,8 +230,8 @@ optimize_buffer(Socket) ->
 
 %% @doc Resolve ALPN protocols from options.
 %%
-%% Checks `alpn_advertise` (library convention) first, then falls back
-%% to `alpn_advertised_protocols` (OTP ssl convention) for users who
+%% Checks `alpn_advertise' (library convention) first, then falls back
+%% to `alpn_advertised_protocols' (OTP ssl convention) for users who
 %% pass raw ssl options.
 -spec get_alpn_protocols(proplists:proplist(), [binary()]) -> [binary()].
 get_alpn_protocols(Opts, Default) ->

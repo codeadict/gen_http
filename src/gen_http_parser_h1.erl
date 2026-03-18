@@ -1,5 +1,15 @@
 -module(gen_http_parser_h1).
 
+-include("include/gen_http_doc.hrl").
+
+?MODULEDOC("""
+HTTP/1.1 wire format encoder and decoder.
+
+Encodes requests into HTTP/1.1 wire format and decodes response
+status lines and headers. Uses `erlang:decode_packet/3` for parsing
+with pre-mapped atom-to-binary conversion for common headers.
+""").
+
 %% Compiler optimizations
 -compile(inline).
 -compile({inline_size, 128}).
@@ -35,6 +45,12 @@
 %%%  API
 %%%=========================================================================
 
+?DOC("""
+Encode an HTTP/1.1 request into wire format.
+
+Builds a complete HTTP/1.1 request from method, target, headers, and body.
+Returns `{ok, iodata()}` on success, `{error, Reason}` if validation fails.
+""").
 -spec encode_request(binary(), binary() | string(), [{binary(), binary()}], iodata() | undefined | stream) ->
     {ok, iodata()} | {error, term()}.
 encode_request(Method, Target, Headers, Body) ->
@@ -51,6 +67,12 @@ encode_request(Method, Target, Headers, Body) ->
             {error, Reason}
     end.
 
+?DOC("""
+Encode a chunk for HTTP/1.1 chunked transfer encoding.
+
+Accepts `eof` to terminate the stream, `{eof, Trailers}` to terminate
+with trailing headers, or raw `iodata()` as a body chunk.
+""").
 -spec encode_chunk(eof | {eof, [{binary(), binary()}]} | iodata()) -> iodata().
 encode_chunk(eof) ->
     [$0, $\r, $\n, $\r, $\n];
@@ -60,6 +82,12 @@ encode_chunk(Chunk) ->
     Length = erlang:iolist_size(Chunk),
     [integer_to_binary(Length, 16), $\r, $\n, Chunk, $\r, $\n].
 
+?DOC("""
+Decode an HTTP/1.1 response status line from binary data.
+
+Returns `{ok, {Version, StatusCode, ReasonPhrase}, Rest}` on success,
+`more` if more data is needed, or `error` on parse failure.
+""").
 -spec decode_response_status_line(binary()) ->
     {ok, {http_version(), status_code(), reason_phrase()}, binary()} | more | error.
 decode_response_status_line(Data) ->
@@ -74,6 +102,12 @@ decode_response_status_line(Data) ->
             error
     end.
 
+?DOC("""
+Decode a single HTTP/1.1 response header from binary data.
+
+Returns `{ok, {Name, Value}, Rest}` for a header, `{ok, eof, Rest}` at
+end of headers, `more` if more data is needed, or `error` on parse failure.
+""").
 -spec decode_response_header(binary()) ->
     {ok, {header_name(), header_value()}, binary()} | {ok, eof, binary()} | more | error.
 decode_response_header(Data) ->

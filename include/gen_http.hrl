@@ -15,3 +15,5 @@
 -type socket() :: gen_tcp:socket() | ssl:sslsocket().
 
 -define(DEFAULT_PROTOCOLS, [http1, http2]).
+
+-include("gen_http_doc.hrl").

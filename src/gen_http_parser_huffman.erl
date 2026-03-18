@@ -1,10 +1,14 @@
 -module(gen_http_parser_huffman).
 
-%% @doc Huffman encoding/decoding for HPACK (RFC 7541 Appendix B).
-%%
-%% This module implements Huffman coding for compressing header field
-%% names and values in HTTP/2. Uses direct pattern matching for decoding
-%% instead of tree traversal, following the hpax implementation approach.
+-include("include/gen_http_doc.hrl").
+
+?MODULEDOC("""
+Huffman coding for HPACK (RFC 7541 Appendix B).
+
+Encodes and decodes header field names and values using the Huffman
+code table defined in the HPACK spec. Decoding uses direct pattern
+matching on bit sequences instead of tree traversal.
+""").
 
 -export([encode/1, decode/1]).
 
@@ -12,7 +16,7 @@
 
 -type huffman_error() :: {huffman_decode_error, binary()}.
 
-%% @doc Encode a binary string using Huffman coding.
+?DOC("Encode a binary string using Huffman coding.").
 -spec encode(binary()) -> binary().
 encode(Data) ->
     Bits = encode_bits(Data, <<>>),
@@ -22,7 +26,7 @@ encode(Data) ->
     PaddingBits = (1 bsl Padding) - 1,
     <<Bits/bitstring, PaddingBits:Padding>>.
 
-%% @doc Decode a Huffman-encoded binary string.
+?DOC("Decode a Huffman-encoded binary string.").
 -spec decode(binary()) -> {ok, binary()} | {error, huffman_error()}.
 decode(Data) ->
     try

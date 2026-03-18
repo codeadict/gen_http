@@ -1,12 +1,20 @@
 -module(gen_http_parser_hpack).
 
-%% @doc HPACK: Header Compression for HTTP/2 (RFC 7541).
-%%
-%% HPACK header compression with static and dynamic tables.
-%% Compression context is pure data (no process state).
-%%
-%% Huffman encoding is used when it reduces string size
-%% (typically ~30% compression for header values).
+-include("include/gen_http_doc.hrl").
+
+?MODULEDOC("""
+HPACK header compression for HTTP/2 (RFC 7541).
+
+Compresses and decompresses HTTP/2 headers using static and dynamic
+tables. The compression context is a plain data structure -- no process
+state, no ETS.
+
+Huffman encoding kicks in automatically when it shrinks the string
+(around 30% savings on typical header values).
+
+The dynamic table evicts oldest entries when it exceeds the configured
+maximum size, per RFC 7541 Section 4.
+""").
 
 -export([
     new/0,
@@ -43,12 +51,12 @@
 %% API Functions
 %%====================================================================
 
-%% @doc Create a new HPACK context with default table size (4096 bytes).
+?DOC("Create a new HPACK context with default table size (4096 bytes).").
 -spec new() -> context().
 new() ->
     new(4096).
 
-%% @doc Create a new HPACK context with specified max table size.
+?DOC("Create a new HPACK context with specified max table size.").
 -spec new(non_neg_integer()) -> context().
 new(MaxSize) ->
     #hpack_context{
@@ -61,17 +69,21 @@ new(MaxSize) ->
         by_name = #{}
     }.
 
-%% @doc Encode headers to HPACK binary format.
-%%
-%% Returns `{ok, EncodedBinary, NewContext}` on success.
+?DOC("""
+Encode headers to HPACK binary format.
+
+Returns `{ok, EncodedBinary, NewContext}` on success.
+""").
 -spec encode(headers(), context()) -> {ok, binary(), context()}.
 encode(Headers, Context) ->
     {Encoded, NewContext} = encode_headers(Headers, Context, <<>>),
     {ok, Encoded, NewContext}.
 
-%% @doc Decode HPACK binary format to headers.
-%%
-%% Returns `{ok, Headers, NewContext}` on success or `{error, Reason}` on failure.
+?DOC("""
+Decode HPACK binary format to headers.
+
+Returns `{ok, Headers, NewContext}` on success or `{error, Reason}` on failure.
+""").
 -spec decode(binary(), context()) -> {ok, headers(), context()} | {error, term()}.
 decode(Data, Context) ->
     try
@@ -82,15 +94,17 @@ decode(Data, Context) ->
             {error, Reason}
     end.
 
-%% @doc Resize dynamic table to new maximum size.
-%%
-%% Evicts entries if necessary to fit within new size limit.
+?DOC("""
+Resize dynamic table to new maximum size.
+
+Evicts entries if necessary to fit within new size limit.
+""").
 -spec resize_table(context(), non_neg_integer()) -> context().
 resize_table(Context, NewMaxSize) ->
     NewContext = Context#hpack_context{max_table_size = NewMaxSize},
     evict_to_fit(NewContext).
 
-%% @doc Set maximum table size (used during settings negotiation).
+?DOC("Set maximum table size (used during settings negotiation).").
 -spec set_max_table_size(context(), non_neg_integer()) -> context().
 set_max_table_size(Context, MaxSize) ->
     resize_table(Context, MaxSize).

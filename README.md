@@ -14,37 +14,7 @@ HTTP/1.1 and HTTP/2 support. Pure Erlang. Zero dependencies.
 
 Fast. Small API. Proper HTTP/1.1 and HTTP/2 support. Works with both protocols transparently.
 
-Built to replace `httpc` with better performance and cleaner code.
-
-## HTTP/2 Compliance
-
-**156 tests** covering RFC 7540 (HTTP/2) and RFC 7541 (HPACK). All frame types, stream states, flow control, priority handling, HPACK compression, and error conditions.
-
-Tested against [h2-client-test-harness](https://github.com/nomadlabsinc/h2-client-test-harness). **100% pass rate**.
-
 ## Quick Start
-
-```erlang
-%% HTTP/1.1
-{ok, Conn} = gen_http:connect(http, "httpbin.org", 80),
-{ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
-
-%% Collect response in active mode (default)
-receive
-    Msg ->
-        case gen_http:stream(Conn2, Msg) of
-            {ok, Conn3, [{status, Ref, 200}, {headers, Ref, Headers}, {data, Ref, Body}, {done, Ref}]} ->
-                io:format("Body: ~s~n", [Body])
-        end
-end.
-
-%% HTTP/2 (automatic via ALPN)
-{ok, Conn} = gen_http:connect(https, "google.com", 443),
-{ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/">>, [], <<>>),
-%% Same API, different protocol
-```
-
-## Installation
 
 Add to your `rebar.config`:
 
@@ -54,86 +24,44 @@ Add to your `rebar.config`:
 ]}.
 ```
 
-## Examples
-
-### Simple GET Request
+Send a request:
 
 ```erlang
 {ok, Conn} = gen_http:connect(http, "httpbin.org", 80),
 {ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
 
-%% Active mode - receive messages
-receive Msg ->
-    {ok, Conn3, Responses} = gen_http:stream(Conn2, Msg),
-    io:format("Responses: ~p~n", [Responses])
+receive
+    Msg ->
+        case gen_http:stream(Conn2, Msg) of
+            {ok, Conn3, [{status, Ref, 200}, {headers, Ref, Headers}, {data, Ref, Body}, {done, Ref}]} ->
+                io:format("Body: ~s~n", [Body])
+        end
 end.
 ```
 
-### POST with Body
+HTTPS with automatic HTTP/2 negotiation:
 
 ```erlang
-{ok, Conn} = gen_http:connect(http, "httpbin.org", 80),
-
-Headers = [{<<"content-type">>, <<"application/json">>}],
-Body = <<"{\"hello\": \"world\"}">>,
-
-{ok, Conn2, Ref} = gen_http:request(Conn, <<"POST">>, <<"/post">>, Headers, Body).
-```
-
-### HTTPS with HTTP/2
-
-```erlang
-%% ALPN automatically negotiates HTTP/2 if available
 {ok, Conn} = gen_http:connect(https, "www.google.com", 443),
 {ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/">>, [], <<>>).
+%% Same API, different protocol
 ```
 
-### Passive Mode (Blocking)
+See the [Getting Started](docs/getting-started.md) guide for POST requests, passive mode, response collection loops, and more.
 
-```erlang
-{ok, Conn} = gen_http:connect(http, "httpbin.org", 80, #{mode => passive}),
-{ok, Conn2, Ref} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
+## HTTP/2 Compliance
 
-%% Blocking receive
-{ok, Conn3, Responses} = gen_http:recv(Conn2, 0, 5000),
-io:format("Responses: ~p~n", [Responses]).
-```
+**156 tests** covering RFC 7540 (HTTP/2) and RFC 7541 (HPACK). All frame types, stream states, flow control, priority handling, HPACK compression, and error conditions.
 
-### Connection Reuse
+Tested against [h2-client-test-harness](https://github.com/nomadlabsinc/h2-client-test-harness). **100% pass rate**.
 
-```erlang
-{ok, Conn} = gen_http:connect(http, "httpbin.org", 80),
+## Documentation
 
-%% First request
-{ok, Conn2, Ref1} = gen_http:request(Conn, <<"GET">>, <<"/get">>, [], <<>>),
-%% ... handle response ...
-
-%% Second request on same connection
-{ok, Conn3, Ref2} = gen_http:request(Conn2, <<"GET">>, <<"/headers">>, [], <<>>),
-%% ... handle response ...
-
-{ok, _} = gen_http:close(Conn3).
-```
-
-### Error Handling
-
-```erlang
-case gen_http:connect(http, "example.com", 80) of
-    {ok, Conn} ->
-        case gen_http:request(Conn, <<"GET">>, <<"/">>, [], <<>>) of
-            {ok, Conn2, Ref} ->
-                handle_success(Conn2, Ref);
-            {error, Conn2, Reason} ->
-                %% Structured errors: {transport_error, _}, {protocol_error, _}, {application_error, _}
-                case gen_http:is_retriable_error(Reason) of
-                    true -> retry_request();
-                    false -> handle_permanent_error(Reason)
-                end
-        end;
-    {error, Reason} ->
-        io:format("Connection failed: ~p~n", [Reason])
-end.
-```
+- [Getting Started](docs/getting-started.md) -- installation, first request, collecting responses
+- [Architecture](docs/architecture.md) -- process-less design, module layout, protocol negotiation
+- [Active and Passive Modes](docs/active-and-passive-modes.md) -- choosing the right I/O model
+- [Error Handling](docs/error-handling.md) -- structured errors, retries, pattern matching
+- [SSL Certificates](docs/ssl-certificates.md) -- TLS config, custom CAs, ALPN
 
 ## Testing
 
@@ -155,12 +83,6 @@ rebar3 ct --suite=h2_compliance_SUITE
 ## Project Status
 
 Early development. API may change.
-
-## Inspiration
-
-- [Mint](https://github.com/elixir-mint/mint) - HTTP client for Elixir
-- [httpcore](https://github.com/encode/httpcore) - Minimal HTTP client for Python
-- [gun](https://github.com/ninenines/gun) - HTTP client for Erlang
 
 ## License
 

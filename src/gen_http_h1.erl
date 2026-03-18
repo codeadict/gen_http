@@ -1,16 +1,6 @@
 -module(gen_http_h1).
 -feature(maybe_expr, enable).
 
-%% @doc HTTP/1.1 connection state machine.
-%%
-%% Process-less HTTP/1.1 client. Supports:
-%% - Request pipelining
-%% - Keep-alive connections
-%% - Chunked transfer encoding
-%% - Body streaming (request and response)
-%%
-%% Connection state is a pure data structure passed between function calls.
-
 %% Targeted inlining for small hot-path helpers
 -compile(
     {inline, [
@@ -26,6 +16,47 @@
 ).
 
 -include("include/gen_http.hrl").
+
+?MODULEDOC("""
+HTTP/1.1 connection state machine.
+
+A process-less HTTP/1.1 client. The connection is a record that you
+thread through function calls -- no gen_server, no spawned process.
+
+## Features
+
+- Request pipelining (send multiple requests before reading responses)
+- Keep-alive connections
+- Chunked transfer encoding
+- Body streaming for both requests and responses
+- Active and passive socket modes
+
+## Direct Usage
+
+Most callers should use `gen_http` instead. Use this module directly
+when you need HTTP/1.1-specific features like body streaming:
+
+```erlang
+{ok, Conn} = gen_http_h1:connect(http, "httpbin.org", 80),
+{ok, Conn2, Ref} = gen_http_h1:request(Conn, <<"POST">>, <<"/post">>,
+    [{<<"content-type">>, <<"text/plain">>},
+     {<<"transfer-encoding">>, <<"chunked">>}],
+    stream),
+{ok, Conn3} = gen_http_h1:stream_request_body(Conn2, <<"chunk 1">>),
+{ok, Conn4} = gen_http_h1:stream_request_body(Conn3, eof).
+```
+
+## Pipelining
+
+You can send several requests on one connection without waiting for
+each response. Responses come back in the same order the requests
+were sent:
+
+```erlang
+{ok, C1, Ref1} = gen_http_h1:request(Conn, <<"GET">>, <<"/a">>, [], <<>>),
+{ok, C2, Ref2} = gen_http_h1:request(C1, <<"GET">>, <<"/b">>, [], <<>>).
+```
+""").
 
 %% Max hex digits in a chunk size line (16 hex chars = 64-bit max)
 -define(MAX_CHUNK_HEX_LEN, 16).
@@ -126,18 +157,23 @@
 %% API Functions
 %%====================================================================
 
-%% @doc Establish an HTTP/1.1 connection with default options.
+?DOC("""
+Establish an HTTP/1.1 connection with default options.
+""").
 -spec connect(scheme(), address(), inet:port_number()) ->
     {ok, conn()} | {error, term()}.
 connect(Scheme, Address, Port) ->
     connect(Scheme, Address, Port, #{}).
 
-%% @doc Establish an HTTP/1.1 connection with options.
-%%
-%% Options:
-%%   - `timeout` (default 5000) - Connection timeout in milliseconds
-%%   - `mode` (default active) - Socket mode (active | passive)
-%%   - `max_pipeline` (default 10) - Maximum pipelined requests
+?DOC("""
+Establish an HTTP/1.1 connection with options.
+
+Options:
+
+- `timeout` (default 5000) - Connection timeout in milliseconds
+- `mode` (default active) - Socket mode (`active` | `passive`)
+- `max_pipeline` (default 10) - Maximum pipelined requests
+""").
 -spec connect(scheme(), address(), inet:port_number(), map()) ->
     {ok, conn()} | {error, term()}.
 connect(Scheme, Address, Port, Opts) ->
@@ -195,13 +231,16 @@ connect_impl(Scheme, Address, Port, Opts) ->
         {error, Reason} -> {error, transport_error({connect_failed, Reason})}
     end.
 
-%% @doc Send an HTTP request.
-%%
-%% Body can be:
-%%   - `iodata()` - Send entire body immediately
-%%   - `stream` - Use stream_request_body/3 to send body chunks
-%%
-%% Returns `{ok, Conn, RequestRef}` on success.
+?DOC("""
+Send an HTTP request.
+
+Body can be:
+
+- `iodata()` - Send entire body immediately
+- `stream` - Use `stream_request_body/3` to send body chunks
+
+Returns `{ok, Conn, RequestRef}` on success.
+""").
 -spec request(conn(), binary(), binary(), headers(), iodata() | stream) ->
     {ok, conn(), request_ref()} | {error, conn(), term()}.
 request(Conn, Method, Path, Headers, Body) ->
@@ -212,9 +251,11 @@ request(Conn, Method, Path, Headers, Body) ->
             {error, Conn, Reason}
     end.
 
-%% @doc Stream a chunk of request body.
-%%
-%% Use `eof` to indicate end of body.
+?DOC("""
+Stream a chunk of request body.
+
+Use `eof` to indicate end of body.
+""").
 -spec stream_request_body(conn(), request_ref(), iodata() | eof) ->
     {ok, conn()} | {error, conn(), term()}.
 stream_request_body(Conn, RequestRef, Chunk) ->
@@ -225,16 +266,17 @@ stream_request_body(Conn, RequestRef, Chunk) ->
             {error, Conn, application_error({invalid_request_ref, RequestRef})}
     end.
 
-%% @doc Receive data from the connection in passive mode.
-%%
-%% This function blocks until data is received or timeout occurs.
-%% The connection must be in passive mode, otherwise this raises badarg.
-%%
-%% Options:
-%%   - ByteCount - Number of bytes to receive (0 for all available)
-%%   - Timeout - Timeout in milliseconds
-%%
-%% Returns `{ok, Conn, Responses}` on success or `{error, Conn, Reason}` on failure.
+?DOC("""
+Receive data from the connection in passive mode.
+
+This function blocks until data is received or timeout occurs.
+The connection must be in passive mode, otherwise this raises `badarg`.
+
+- `ByteCount` - Number of bytes to receive (0 for all available)
+- `Timeout` - Timeout in milliseconds
+
+Returns `{ok, Conn, Responses}` on success or `{error, Conn, Reason}` on failure.
+""").
 -spec recv(conn(), non_neg_integer(), timeout()) ->
     {ok, conn(), [response()]} | {error, conn(), term()}.
 recv(#gen_http_h1_conn{mode = passive} = Conn, ByteCount, Timeout) ->
@@ -253,18 +295,22 @@ recv(#gen_http_h1_conn{mode = passive} = Conn, ByteCount, Timeout) ->
 recv(#gen_http_h1_conn{mode = active}, _, _) ->
     error(badarg, [recv_requires_passive_mode]).
 
-%% @doc Switch the connection socket mode between active and passive.
-%%
-%% Active mode (default):
-%%   - Socket delivers messages to the owning process automatically
-%%   - Uses `{active, once}` for flow control
-%%   - Process them with `stream/2`
-%%
-%% Passive mode:
-%%   - Explicit data retrieval using `recv/3`
-%%   - Blocks until data is available
-%%
-%% Returns `{ok, Conn}` with updated mode or `{error, Conn, Reason}` on failure.
+?DOC("""
+Switch the connection socket mode between active and passive.
+
+Active mode (default):
+
+- Socket delivers messages to the owning process automatically
+- Uses `{active, once}` for flow control
+- Process them with `stream/2`
+
+Passive mode:
+
+- Explicit data retrieval using `recv/3`
+- Blocks until data is available
+
+Returns `{ok, Conn}` with updated mode or `{error, Conn, Reason}` on failure.
+""").
 -spec set_mode(conn(), active | passive) -> {ok, conn()} | {error, conn(), term()}.
 set_mode(Conn, Mode) when Mode =:= active; Mode =:= passive ->
     #gen_http_h1_conn{transport = Transport, socket = Socket, mode = CurrentMode} = Conn,
@@ -285,14 +331,16 @@ set_mode(Conn, Mode) when Mode =:= active; Mode =:= passive ->
             end
     end.
 
-%% @doc Transfer socket ownership to another process.
-%%
-%% This is useful for connection pooling patterns where you want to hand off
-%% an established connection to a worker process.
-%%
-%% After calling this, the new process will receive socket messages.
-%%
-%% Returns `{ok, Conn}` on success or `{error, Conn, Reason}` on failure.
+?DOC("""
+Transfer socket ownership to another process.
+
+This is useful for connection pooling patterns where you want to hand off
+an established connection to a worker process.
+
+After calling this, the new process will receive socket messages.
+
+Returns `{ok, Conn}` on success or `{error, Conn, Reason}` on failure.
+""").
 -spec controlling_process(conn(), pid()) -> {ok, conn()} | {error, conn(), term()}.
 controlling_process(Conn, Pid) when is_pid(Pid) ->
     #gen_http_h1_conn{transport = Transport, socket = Socket} = Conn,
@@ -301,20 +349,24 @@ controlling_process(Conn, Pid) when is_pid(Pid) ->
         {error, Reason} -> {error, Conn, transport_error({controlling_process_failed, Reason})}
     end.
 
-%% @doc Enable or disable debug logging for this connection.
-%%
-%% When enabled, the connection will log debug information about frames,
-%% requests, and responses. This is useful for debugging but adds overhead.
-%%
-%% Returns `{ok, Conn}` with updated logging state.
+?DOC("""
+Enable or disable debug logging for this connection.
+
+When enabled, the connection will log debug information about frames,
+requests, and responses. This is useful for debugging but adds overhead.
+
+Returns `{ok, Conn}` with updated logging state.
+""").
 -spec put_log(conn(), boolean()) -> {ok, conn()}.
 put_log(Conn, Log) when is_boolean(Log) ->
     {ok, Conn#gen_http_h1_conn{log = Log}}.
 
-%% @doc Process incoming socket messages.
-%%
-%% Call this function when receiving TCP/SSL messages.
-%% Returns parsed responses or errors.
+?DOC("""
+Process incoming socket messages.
+
+Call this function when receiving TCP/SSL messages.
+Returns parsed responses or errors.
+""").
 -spec stream(conn(), term()) ->
     {ok, conn(), [response()]}
     | {error, conn(), term(), [response()]}
@@ -331,7 +383,9 @@ stream(Conn, Message) ->
         _ -> unknown
     end.
 
-%% @doc Close the connection.
+?DOC("""
+Close the connection.
+""").
 -spec close(conn()) -> {ok, conn()}.
 close(Conn) ->
     case Conn#gen_http_h1_conn.state of
@@ -344,16 +398,20 @@ close(Conn) ->
             {ok, Conn}
     end.
 
-%% @doc Check if connection is open.
+?DOC("""
+Check if connection is open.
+""").
 -spec is_open(conn()) -> boolean().
 is_open(#gen_http_h1_conn{state = State}) ->
     State =:= open.
 
-%% @doc Check if the underlying socket is still alive.
-%%
-%% Does a non-blocking recv to detect if the server has closed the connection
-%% while it was idle. Useful for connection pool implementations that want to
-%% avoid sending requests on stale connections.
+?DOC("""
+Check if the underlying socket is still alive.
+
+Does a non-blocking recv to detect if the server has closed the connection
+while it was idle. Useful for connection pool implementations that want to
+avoid sending requests on stale connections.
+""").
 -spec is_alive(conn()) -> boolean().
 is_alive(#gen_http_h1_conn{state = closed}) ->
     false;
@@ -365,31 +423,41 @@ is_alive(#gen_http_h1_conn{transport = Transport, socket = Socket}) ->
         {error, _} -> false
     end.
 
-%% @doc Get the underlying socket.
+?DOC("""
+Get the underlying socket.
+""").
 -spec get_socket(conn()) -> socket().
 get_socket(#gen_http_h1_conn{socket = Socket}) ->
     Socket.
 
-%% @doc Store a private key-value pair in the connection.
-%%
-%% Attach metadata to connections (e.g., pool ID, metrics, tags).
+?DOC("""
+Store a private key-value pair in the connection.
+
+Attach metadata to connections (e.g., pool ID, metrics, tags).
+""").
 -spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
 put_private(#gen_http_h1_conn{private = Private} = Conn, Key, Value) ->
     Conn#gen_http_h1_conn{private = Private#{Key => Value}}.
 
-%% @doc Get a private value from the connection.
-%%
-%% Returns `undefined` if the key doesn't exist.
+?DOC("""
+Get a private value from the connection.
+
+Returns `undefined` if the key doesn't exist.
+""").
 -spec get_private(conn(), Key :: term()) -> term() | undefined.
 get_private(Conn, Key) ->
     get_private(Conn, Key, undefined).
 
-%% @doc Get a private value from the connection with a default.
+?DOC("""
+Get a private value from the connection with a default.
+""").
 -spec get_private(conn(), Key :: term(), Default :: term()) -> term().
 get_private(#gen_http_h1_conn{private = Private}, Key, Default) ->
     maps:get(Key, Private, Default).
 
-%% @doc Delete a private key from the connection.
+?DOC("""
+Delete a private key from the connection.
+""").
 -spec delete_private(conn(), Key :: term()) -> conn().
 delete_private(#gen_http_h1_conn{private = Private} = Conn, Key) ->
     Conn#gen_http_h1_conn{private = maps:remove(Key, Private)}.
@@ -1000,7 +1068,7 @@ parse_chunk_data(Buffer, ReqState, Ref, Size) ->
 %% @doc Parse optional trailer headers after the zero-length final chunk.
 %% RFC 9112 Section 7.1.2: trailers may appear between the last chunk and
 %% the final CRLF. When no trailers are present, decode_response_header
-%% returns `{ok, eof, Rest}` on seeing `\r\n` immediately.
+%% returns `{ok, eof, Rest}' on seeing `\r\n' immediately.
 -spec parse_trailers(binary(), request_state(), request_ref(), headers()) ->
     {done, [response()], request_state(), binary()}
     | {continue, [response()], request_state(), binary()}

@@ -1,6 +1,18 @@
 -module(gen_http_parser_h2).
 
+-include("include/gen_http_doc.hrl").
 -include("gen_http_h2_frames.hrl").
+
+?MODULEDOC("""
+HTTP/2 frame encoder and decoder.
+
+Parses the HTTP/2 binary framing layer as defined in RFC 9113.
+Handles all frame types: DATA, HEADERS, PRIORITY, RST_STREAM,
+SETTINGS, PUSH_PROMISE, PING, GOAWAY, WINDOW_UPDATE, and CONTINUATION.
+
+Frame flags are manipulated with `set_flags/2` and `is_flag_set/3`.
+Error codes are translated between integer wire format and human-readable atoms.
+""").
 
 -define(MAX_FRAME_SIZE, 16384).
 
@@ -264,7 +276,7 @@ decode_contents(_Type, _Flags, _StreamId, _Payload) ->
 
 %% Decodes the next frame of the given binary.
 %%
-%% Returns `{:ok, frame, rest}` if successful, `{:error, reason}` if not.
+%% Returns `{:ok, frame, rest}' if successful, `{:error, reason}' if not.
 -spec decode_next(binary()) ->
     {ok, packet(), binary()}
     | more

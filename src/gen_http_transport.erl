@@ -2,9 +2,19 @@
 
 -include("include/gen_http.hrl").
 
+?MODULEDOC("""
+Transport behaviour for pluggable network backends.
+
+Defines the callbacks that TCP and SSL transport modules must implement.
+`gen_http` ships with two implementations: `gen_http_tcp` and `gen_http_ssl`.
+
+This module is used internally by the connection modules to abstract over
+the underlying socket type.
+""").
+
 -export([module_for_scheme/1]).
 
--export_type([scheme/0]).
+-export_type([scheme/0, address/0, socket/0]).
 
 -callback connect(
     Address :: address(),
@@ -50,7 +60,12 @@
 %% Utility Functions
 %%====================================================================
 
-%% @doc Returns the transport module for a given scheme.
+?DOC("""
+Returns the transport module for a given scheme.
+
+- `http` -> `gen_http_tcp`
+- `https` -> `gen_http_ssl`
+""").
 -spec module_for_scheme(scheme()) -> module().
 module_for_scheme(http) -> gen_http_tcp;
 module_for_scheme(https) -> gen_http_ssl.

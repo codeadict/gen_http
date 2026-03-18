@@ -1,18 +1,6 @@
 -module(gen_http_h2).
 -feature(maybe_expr, enable).
 
-%% @doc HTTP/2 connection state machine.
-%%
-%% Process-less HTTP/2 client. Supports:
-%% - Stream multiplexing (multiple concurrent requests)
-%% - Flow control (connection and stream level)
-%% - Settings negotiation
-%% - HPACK header compression
-%% - Server push
-%% - GOAWAY handling
-%%
-%% Connection state is a pure data structure passed between function calls.
-
 %% Targeted inlining for small hot-path helpers
 -compile(
     {inline, [
@@ -32,6 +20,47 @@
 
 -include("include/gen_http.hrl").
 -include("gen_http_h2_frames.hrl").
+
+?MODULEDOC("""
+HTTP/2 connection state machine.
+
+A process-less HTTP/2 client implementing RFC 9113. The connection
+is a record that you thread through function calls.
+
+## Features
+
+- Stream multiplexing -- multiple concurrent requests on one connection
+- Flow control at connection and stream levels
+- HPACK header compression (RFC 7541)
+- Settings negotiation
+- Server push handling
+- GOAWAY with graceful shutdown
+
+## Direct Usage
+
+Most callers should use `gen_http` instead. Use this module directly
+when you need HTTP/2-specific features like window sizes:
+
+```erlang
+{ok, Conn} = gen_http_h2:connect(https, "example.com", 443),
+{ok, Conn2, Ref, StreamId} = gen_http_h2:request(Conn, <<"GET">>, <<"/">>, [], <<>>),
+
+%% Check flow control window
+WindowSize = gen_http_h2:get_window_size(Conn2, StreamId).
+```
+
+## Multiplexing
+
+Unlike HTTP/1.1, HTTP/2 lets you send multiple requests concurrently.
+Each request gets its own stream. Responses can arrive in any order,
+and each response event is tagged with the request's `Ref`:
+
+```erlang
+{ok, C1, Ref1, _} = gen_http_h2:request(Conn, <<"GET">>, <<"/a">>, [], <<>>),
+{ok, C2, Ref2, _} = gen_http_h2:request(C1, <<"GET">>, <<"/b">>, [], <<>>).
+%% Responses for Ref1 and Ref2 arrive independently
+```
+""").
 
 -export([
     connect/3,
@@ -181,13 +210,17 @@
 %% API Functions
 %%====================================================================
 
-%% @doc Establish an HTTP/2 connection.
+?DOC("""
+Establish an HTTP/2 connection.
+""").
 -spec connect(scheme(), address(), inet:port_number()) ->
     {ok, conn()} | {error, term()}.
 connect(Scheme, Address, Port) ->
     connect(Scheme, Address, Port, #{}).
 
-%% @doc Establish an HTTP/2 connection with options.
+?DOC("""
+Establish an HTTP/2 connection with options.
+""").
 -spec connect(scheme(), address(), inet:port_number(), map()) ->
     {ok, conn()} | {error, term()}.
 connect(Scheme, Address, Port, Opts) ->
@@ -251,13 +284,17 @@ connect_impl(Scheme, Address, Port, Opts) ->
         {error, Reason} -> {error, transport_error({connect_failed, Reason})}
     end.
 
-%% @doc Send an HTTP/2 request.
+?DOC("""
+Send an HTTP/2 request.
+""").
 -spec request(conn(), binary(), binary(), headers(), iodata() | stream) ->
     {ok, conn(), reference(), stream_id()} | {error, conn(), term()}.
 request(Conn, Method, Path, Headers, Body) ->
     send_request(Conn, Method, Path, Headers, Body).
 
-%% @doc Process socket messages (active mode).
+?DOC("""
+Process socket messages (active mode).
+""").
 -spec stream(conn(), term()) ->
     {ok, conn(), [h2_response()]}
     | {error, conn(), term(), [h2_response()]}
@@ -274,22 +311,25 @@ stream(Conn, Message) ->
         _ -> unknown
     end.
 
-%% @doc Stream request body (chunked upload).
+?DOC("""
+Stream request body (chunked upload).
+""").
 -spec stream_request_body(conn(), stream_id(), iodata() | eof) ->
     {ok, conn()} | {error, conn(), term()}.
 stream_request_body(Conn, StreamId, Chunk) ->
     send_data_frame(Conn, StreamId, Chunk, false).
 
-%% @doc Receive data from the connection in passive mode.
-%%
-%% This function blocks until data is received or timeout occurs.
-%% The connection must be in passive mode, otherwise this raises badarg.
-%%
-%% Options:
-%%   - ByteCount - Number of bytes to receive (0 for all available)
-%%   - Timeout - Timeout in milliseconds
-%%
-%% Returns `{ok, Conn, Responses}` on success or `{error, Conn, Reason}` on failure.
+?DOC("""
+Receive data from the connection in passive mode.
+
+This function blocks until data is received or timeout occurs.
+The connection must be in passive mode, otherwise this raises `badarg`.
+
+- `ByteCount` - number of bytes to receive (0 for all available)
+- `Timeout` - timeout in milliseconds
+
+Returns `{ok, Conn, Responses}` on success or `{error, Conn, Reason}` on failure.
+""").
 -spec recv(conn(), non_neg_integer(), timeout()) ->
     {ok, conn(), [h2_response()]} | {error, conn(), term()}.
 recv(#gen_http_h2_conn{mode = passive} = Conn, ByteCount, Timeout) ->
@@ -308,18 +348,20 @@ recv(#gen_http_h2_conn{mode = passive} = Conn, ByteCount, Timeout) ->
 recv(#gen_http_h2_conn{mode = active}, _, _) ->
     error(badarg, [recv_requires_passive_mode]).
 
-%% @doc Switch the connection socket mode between active and passive.
-%%
-%% Active mode (default):
-%%   - Socket delivers messages to the owning process automatically
-%%   - Uses `{active, once}` for flow control
-%%   - Process them with `stream/2`
-%%
-%% Passive mode:
-%%   - Explicit data retrieval using `recv/3`
-%%   - Blocks until data is available
-%%
-%% Returns `{ok, Conn}` with updated mode or `{error, Conn, Reason}` on failure.
+?DOC("""
+Switch the connection socket mode between active and passive.
+
+Active mode (default):
+- Socket delivers messages to the owning process automatically
+- Uses `{active, once}` for flow control
+- Process them with `stream/2`
+
+Passive mode:
+- Explicit data retrieval using `recv/3`
+- Blocks until data is available
+
+Returns `{ok, Conn}` with updated mode or `{error, Conn, Reason}` on failure.
+""").
 -spec set_mode(conn(), active | passive) -> {ok, conn()} | {error, conn(), term()}.
 set_mode(Conn, Mode) when Mode =:= active; Mode =:= passive ->
     #gen_http_h2_conn{transport = Transport, socket = Socket, mode = CurrentMode} = Conn,
@@ -340,14 +382,16 @@ set_mode(Conn, Mode) when Mode =:= active; Mode =:= passive ->
             end
     end.
 
-%% @doc Transfer socket ownership to another process.
-%%
-%% This is useful for connection pooling patterns where you want to hand off
-%% an established connection to a worker process.
-%%
-%% After calling this, the new process will receive socket messages.
-%%
-%% Returns `{ok, Conn}` on success or `{error, Conn, Reason}` on failure.
+?DOC("""
+Transfer socket ownership to another process.
+
+Useful for connection pooling patterns where you want to hand off
+an established connection to a worker process.
+
+After calling this, the new process will receive socket messages.
+
+Returns `{ok, Conn}` on success or `{error, Conn, Reason}` on failure.
+""").
 -spec controlling_process(conn(), pid()) -> {ok, conn()} | {error, conn(), term()}.
 controlling_process(Conn, Pid) when is_pid(Pid) ->
     #gen_http_h2_conn{transport = Transport, socket = Socket} = Conn,
@@ -356,17 +400,21 @@ controlling_process(Conn, Pid) when is_pid(Pid) ->
         {error, Reason} -> {error, Conn, transport_error({controlling_process_failed, Reason})}
     end.
 
-%% @doc Enable or disable debug logging for this connection.
-%%
-%% When enabled, the connection will log debug information about frames,
-%% requests, and responses. This is useful for debugging but adds overhead.
-%%
-%% Returns `{ok, Conn}` with updated logging state.
+?DOC("""
+Enable or disable debug logging for this connection.
+
+When enabled, the connection will log debug information about frames,
+requests, and responses. Useful for debugging but adds overhead.
+
+Returns `{ok, Conn}` with updated logging state.
+""").
 -spec put_log(conn(), boolean()) -> {ok, conn()}.
 put_log(Conn, Log) when is_boolean(Log) ->
     {ok, Conn#gen_http_h2_conn{log = Log}}.
 
-%% @doc Close the connection.
+?DOC("""
+Close the connection.
+""").
 -spec close(conn()) -> {ok, conn()}.
 close(Conn) ->
     case Conn#gen_http_h2_conn.state of
@@ -390,16 +438,20 @@ close(Conn) ->
             {ok, Conn}
     end.
 
-%% @doc Check if connection is open.
+?DOC("""
+Check if connection is open.
+""").
 -spec is_open(conn()) -> boolean().
 is_open(#gen_http_h2_conn{state = State}) ->
     State =:= open.
 
-%% @doc Check if the underlying socket is still alive.
-%%
-%% Does a non-blocking recv to detect if the server has closed the connection
-%% while it was idle. Useful for connection pool implementations that want to
-%% avoid sending requests on stale connections.
+?DOC("""
+Check if the underlying socket is still alive.
+
+Does a non-blocking recv to detect if the server has closed the connection
+while it was idle. Useful for connection pool implementations that want to
+avoid sending requests on stale connections.
+""").
 -spec is_alive(conn()) -> boolean().
 is_alive(#gen_http_h2_conn{state = State}) when State =:= closed; State =:= closing ->
     false;
@@ -411,17 +463,21 @@ is_alive(#gen_http_h2_conn{transport = Transport, socket = Socket}) ->
         {error, _} -> false
     end.
 
-%% @doc Get the underlying socket.
+?DOC("""
+Get the underlying socket.
+""").
 -spec get_socket(conn()) -> socket().
 get_socket(#gen_http_h2_conn{socket = Socket}) ->
     Socket.
 
-%% @doc Get available send window size.
-%%
-%% Pass `StreamId = 0` for the connection-level window, or a stream ID
-%% for the effective window (min of connection and stream windows).
-%% Callers using `stream_request_body/3` should check this before
-%% sending to avoid exceeding the flow control window.
+?DOC("""
+Get available send window size.
+
+Pass `StreamId = 0` for the connection-level window, or a stream ID
+for the effective window (min of connection and stream windows).
+Callers using `stream_request_body/3` should check this before
+sending to avoid exceeding the flow control window.
+""").
 -spec get_window_size(conn(), stream_id() | 0) -> {ok, non_neg_integer()} | {error, term()}.
 get_window_size(Conn, 0) ->
     {ok, Conn#gen_http_h2_conn.send_window};
@@ -435,26 +491,34 @@ get_window_size(Conn, StreamId) ->
             {error, {invalid_stream_id, StreamId}}
     end.
 
-%% @doc Store a private key-value pair in the connection.
-%%
-%% Attach metadata to connections (e.g., pool ID, metrics, tags).
+?DOC("""
+Store a private key-value pair in the connection.
+
+Attach metadata to connections (e.g., pool ID, metrics, tags).
+""").
 -spec put_private(conn(), Key :: term(), Value :: term()) -> conn().
 put_private(#gen_http_h2_conn{private = Private} = Conn, Key, Value) ->
     Conn#gen_http_h2_conn{private = Private#{Key => Value}}.
 
-%% @doc Get a private value from the connection.
-%%
-%% Returns `undefined` if the key doesn't exist.
+?DOC("""
+Get a private value from the connection.
+
+Returns `undefined` if the key doesn't exist.
+""").
 -spec get_private(conn(), Key :: term()) -> term() | undefined.
 get_private(Conn, Key) ->
     get_private(Conn, Key, undefined).
 
-%% @doc Get a private value from the connection with a default.
+?DOC("""
+Get a private value from the connection with a default.
+""").
 -spec get_private(conn(), Key :: term(), Default :: term()) -> term().
 get_private(#gen_http_h2_conn{private = Private}, Key, Default) ->
     maps:get(Key, Private, Default).
 
-%% @doc Delete a private key from the connection.
+?DOC("""
+Delete a private key from the connection.
+""").
 -spec delete_private(conn(), Key :: term()) -> conn().
 delete_private(#gen_http_h2_conn{private = Private} = Conn, Key) ->
     Conn#gen_http_h2_conn{private = maps:remove(Key, Private)}.
@@ -1483,7 +1547,7 @@ update_stream(Conn, StreamId, Stream) ->
 %%
 %% Called when both endpoints have sent END_STREAM (RFC 7540 §5.1).
 %% Frees resources and keeps the stream count accurate for
-%% `max_concurrent_streams` enforcement.
+%% `max_concurrent_streams' enforcement.
 -spec remove_stream(conn(), stream_id()) -> conn().
 remove_stream(Conn, StreamId) ->
     Streams = maps:remove(StreamId, Conn#gen_http_h2_conn.streams),

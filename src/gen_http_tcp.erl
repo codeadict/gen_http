@@ -3,6 +3,14 @@
 
 -include("include/gen_http.hrl").
 
+?MODULEDOC("""
+TCP transport for plain HTTP connections.
+
+Implements the `gen_http_transport` behaviour using `gen_tcp`.
+Sets `TCP_NODELAY` for low latency and auto-tunes buffer sizes
+to match the OS socket buffers.
+""").
+
 -export([
     connect/3,
     upgrade/5,
@@ -19,16 +27,17 @@
 
 -export_type([address/0, scheme/0, socket/0]).
 
-%% @doc Establish a TCP connection to the given address and port.
-%%
-%% Opens a TCP socket with binary mode, raw packets, active=false initially,
-%% and TCP_NODELAY enabled for low latency.
-%%
-%% Options:
-%%   - `timeout` (default 5000) - Connection timeout in milliseconds
-%%   - `socket_opts` - Additional socket options to pass to gen_tcp
-%%
-%% Returns `{ok, Socket}` on success or `{error, Reason}` on failure.
+?DOC("""
+Establish a TCP connection to the given address and port.
+
+Opens a TCP socket with binary mode, raw packets, `active=false` initially,
+and `TCP_NODELAY` enabled for low latency.
+
+Options:
+
+- `timeout` (default 5000) - Connection timeout in milliseconds
+- `socket_opts` - Additional socket options to pass to `gen_tcp`
+""").
 -spec connect(address(), inet:port_number(), proplists:proplist()) ->
     {ok, socket()} | {error, term()}.
 connect(Address, Port, Opts) ->
@@ -67,71 +76,67 @@ connect(Address, Port, Opts) ->
             Err
     end.
 
-%% @doc Upgrade is not supported for plain TCP transport.
-%%
-%% TCP connections cannot be upgraded to TLS. Use gen_http_ssl for secure connections.
+?DOC("Upgrade is not supported for plain TCP. Always returns `{error, not_supported}`.").
 -spec upgrade(socket(), scheme(), binary(), inet:port_number(), proplists:proplist()) ->
     {ok, socket()} | {error, term()}.
 upgrade(_Socket, _OriginalScheme, _Hostname, _Port, _Opts) ->
     {error, not_supported}.
 
-%% @doc ALPN protocol negotiation is not available for plain TCP.
-%%
-%% Protocol negotiation requires TLS with ALPN extension.
+?DOC("ALPN negotiation is not available for plain TCP. Always returns `{error, protocol_not_negotiated}`.").
 -spec negotiated_protocol(socket()) -> {error, protocol_not_negotiated}.
 negotiated_protocol(_Socket) ->
     {error, protocol_not_negotiated}.
 
-%% @doc Send data through the TCP socket.
+?DOC("Send data through the TCP socket.").
 -spec send(socket(), iodata()) -> ok | {error, term()}.
 send(Socket, Data) ->
     gen_tcp:send(Socket, Data).
 
-%% @doc Close the TCP socket.
+?DOC("Close the TCP socket.").
 -spec close(socket()) -> ok | {error, term()}.
 close(Socket) ->
     gen_tcp:close(Socket).
 
-%% @doc Set socket options.
-%%
-%% Common options:
-%%   - `{active, true | false | once | N}` - Control message delivery
-%%   - `{buffer, Size}` - Set buffer size
-%%   - `{packet, Type}` - Packet framing mode
+?DOC("""
+Set socket options.
+
+Common options:
+
+- `{active, true | false | once | N}` - Control message delivery
+- `{buffer, Size}` - Set buffer size
+- `{packet, Type}` - Packet framing mode
+""").
 -spec setopts(socket(), list()) -> ok | {error, term()}.
 setopts(Socket, Opts) ->
     inet:setopts(Socket, Opts).
 
-%% @doc Transfer socket ownership to another process.
-%%
-%% The new process will receive TCP messages for this socket.
+?DOC("Transfer socket ownership to another process. The new process will receive TCP messages for this socket.").
 -spec controlling_process(socket(), pid()) -> ok | {error, term()}.
 controlling_process(Socket, Pid) ->
     gen_tcp:controlling_process(Socket, Pid).
 
-%% @doc Receive data from the TCP socket in passive mode.
-%%
-%% This function blocks until data is received or timeout occurs.
-%% Length of 0 means receive all available data.
-%%
-%% Returns `{ok, Data}` on success, `{error, closed}` if socket closed,
-%% or `{error, Reason}` on other errors.
+?DOC("""
+Receive data from the TCP socket in passive mode.
+
+Blocks until data is received or timeout occurs.
+A `Length` of 0 means receive all available data.
+""").
 -spec recv(socket(), non_neg_integer(), timeout()) ->
     {ok, binary() | list()} | {error, term()}.
 recv(Socket, Length, Timeout) ->
     gen_tcp:recv(Socket, Length, Timeout).
 
-%% @doc Get the remote address and port.
+?DOC("Get the remote address and port.").
 -spec peername(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Socket) ->
     inet:peername(Socket).
 
-%% @doc Get the local address and port.
+?DOC("Get the local address and port.").
 -spec sockname(socket()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 sockname(Socket) ->
     inet:sockname(Socket).
 
-%% @doc Get socket statistics (bytes sent/received, etc.).
+?DOC("Get socket statistics (bytes sent/received, etc.).").
 -spec getstat(socket()) -> {ok, [{atom(), integer()}]} | {error, term()}.
 getstat(Socket) ->
     inet:getstat(Socket).
