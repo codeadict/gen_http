@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish to Hex
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28.1'
+          rebar3-version: '3.25.0'
+
+      - name: Verify version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          FILE_VERSION="$(cat VERSION)"
+          if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) does not match VERSION file ($FILE_VERSION)"
+            exit 1
+          fi
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Build documentation
+        run: rebar3 ex_doc
+
+      - name: Verify doc artifacts
+        run: |
+          test -d doc || (echo "doc directory not created" && exit 1)
+          test -f doc/index.html || (echo "doc/index.html not found" && exit 1)
+          echo "Documentation built successfully"
+
+      - name: Publish to Hex
+        run: rebar3 hex publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish docs to Hex
+        run: rebar3 hex docs publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Extract release notes from CHANGELOG
+        id: changelog
+        run: |
+          VERSION="$(cat VERSION)"
+          # Extract the section for this version (between its ## header and the next ## or EOF)
+          NOTES=$(awk "/^## ${VERSION//./\\.} /{found=1; next} /^## /{if(found) exit} found{print}" CHANGELOG.md)
+          # Write to file to avoid quoting issues
+          echo "$NOTES" > /tmp/release_notes.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: /tmp/release_notes.md
