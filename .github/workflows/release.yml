@@ -44,20 +44,15 @@ jobs:
           test -f doc/index.html || (echo "doc/index.html not found" && exit 1)
           echo "Documentation built successfully"
 
-      - name: Configure Hex authentication
-        run: |
-          mkdir -p ~/.config/rebar3
-          cat > ~/.config/rebar3/hex.config <<EOF
-          {api_key, <<"$HEX_API_KEY">>}.
-          EOF
+      - name: Publish to Hex
+        run: rebar3 hex publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
-      - name: Publish to Hex
-        run: rebar3 hex publish --yes
-
       - name: Publish docs to Hex
         run: rebar3 hex docs publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
       - name: Extract release notes from CHANGELOG
         id: changelog
