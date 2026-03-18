@@ -96,15 +96,15 @@ jobs:
 
       - name: Generate coverage report
         if: ${{ matrix.coverage }}
-        run: rebar3 as test codecov analyze
+        run: rebar3 covertool generate
 
       - name: Upload coverage to Codecov
         if: ${{ matrix.coverage }}
         uses: codecov/codecov-action@v5.5.2
         with:
-          files: _build/test/codecov/codecov.json
+          files: _build/test/covertool/gen_http.covertool.xml
           fail_ci_if_error: true
           flags: erlang-${{ matrix.otp }}
           name: Erlang/OTP ${{ matrix.otp }}
-          verbose: true # optional (default = false)
+          verbose: true
           token: ${{ secrets.CODECOV_TOKEN }}
