@@ -19,9 +19,6 @@ caddy_data/
 caddy_config/
 .caddy_storage/
 
-# Environment
-.env
-
 # Erlang mk
 *.d
 ebin/
