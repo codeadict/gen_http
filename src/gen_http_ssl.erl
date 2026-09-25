@@ -40,6 +40,7 @@ Options:
 - `socket_opts` - Additional SSL options
 - `verify` (default `verify_peer`) - Certificate verification mode
 - `cacerts` - CA certificates for verification
+- `tls` - Pin the TLS version: `"1.2"` or `"1.3"`. Absent: OTP default.
 """).
 -spec connect(address(), inet:port_number(), proplists:proplist()) ->
     {ok, socket()} | {error, term()}.
@@ -71,9 +72,8 @@ connect(Address, Port, Opts) ->
         {packet, raw},
         {active, false},
         {alpn_advertised_protocols, AlpnProtocols},
-        {reuseaddr, true},
-        {reuse_sessions, true}
-        | SniOpts ++ [{K, V} || {K, V} <- Opts, K =:= sndbuf orelse K =:= recbuf]
+        {reuseaddr, true}
+        | session_opts(Opts) ++ SniOpts ++ [{K, V} || {K, V} <- Opts, K =:= sndbuf orelse K =:= recbuf]
     ],
 
     %% Add verification options (verify_peer by default)
@@ -95,7 +95,8 @@ connect(Address, Port, Opts) ->
         end,
 
     %% Combine all options
-    SocketOpts = BaseOpts ++ VerifyOpts ++ proplists:get_value(socket_opts, Opts, []),
+    SocketOpts = BaseOpts ++ VerifyOpts ++ tls_version_opts(Opts)
+                 ++ proplists:get_value(socket_opts, Opts, []),
 
     case ssl:connect(NormalizedAddress, Port, SocketOpts, Timeout) of
         {ok, Socket} ->
@@ -129,7 +130,7 @@ upgrade(Socket, _OriginalScheme, Hostname, _Port, Opts) ->
         {active, false},
         {alpn_advertised_protocols, AlpnProtocols},
         {server_name_indication, binary_to_list(Hostname)}
-        | proplists:get_value(socket_opts, Opts, [])
+        | tls_version_opts(Opts) ++ proplists:get_value(socket_opts, Opts, [])
     ],
 
     ssl:connect(Socket, SSLOpts, Timeout).
@@ -259,4 +260,24 @@ get_cacerts_opts(Opts) ->
             end;
         CACerts ->
             [{cacerts, CACerts}]
+    end.
+
+%% `{tls, "1.2"}' / `{tls, "1.3"}' pins the negotiated TLS version.
+%% Anything else is a configuration error, raised before connecting.
+-spec tls_version_opts(proplists:proplist()) -> [{versions, [ssl:tls_version()]}].
+tls_version_opts(Opts) ->
+    case proplists:get_value(tls, Opts) of
+        undefined -> [];
+        "1.2"     -> [{versions, ['tlsv1.2']}];
+        "1.3"     -> [{versions, ['tlsv1.3']}];
+        Other     -> error({invalid_tls_version, Other})
+    end.
+
+%% `reuse_sessions' is a TLS =< 1.2 option: OTP rejects it alongside a
+%% TLS-1.3-only `versions' list, so drop it when 1.3 is pinned.
+-spec session_opts(proplists:proplist()) -> [{reuse_sessions, true}].
+session_opts(Opts) ->
+    case proplists:get_value(tls, Opts) of
+        "1.3" -> [];
+        _     -> [{reuse_sessions, true}]
     end.
